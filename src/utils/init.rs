@@ -2,81 +2,73 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-fn repoExists(repo: &str) -> bool {
-    // let path = Path::new(".gyt");
-    // path.is_dir()
-    // here i have to check the server if the repo already exists
-    false
-}
+use super::config::{Config, IgnoreSection, RepoSection, SshSection};
+use super::repo;
 
-fn alreadyInitialized(repo: &str) -> bool {
-    let path = Path::new(".gyt");
-    path.is_dir()
-}
-
-fn createRepo(repo: &str, username: &str, server: &str) {
-    println!("creating repo: {}", repo);
-
-    let config = format!(
-        r#"
-[repo]
-name = "{}"
-username = "{}"
-server = "{}"
-    "#,
-        repo, username, server
-    );
-
-    //we will make the repo in here now
-    fs::create_dir_all(".gyt/").unwrap();
-    fs::create_dir_all(".gyt/stages").unwrap();
-    fs::create_dir_all(".gyt/current").unwrap();
-    fs::write(".gyt/config.toml", config).unwrap();
+fn already_initialized() -> bool {
+    Path::new(".gyt").is_dir()
 }
 
 fn prompt(q: &str) -> String {
     print!("{}: ", q);
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
     let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
+    let _ = io::stdin().read_line(&mut input);
     input.trim().to_string()
 }
 
-pub fn init() {
-    if alreadyInitialized(".gyt") {
-        println!("already initialized");
-        std::process::exit(0);
+pub fn init() -> Result<(), String> {
+    if already_initialized() {
+        return Err("already initialized (.gyt exists)".to_string());
     }
 
     let repo = prompt("repo name");
-
-    if repoExists(&repo) {
-        println!("repo already exists");
+    if repo.is_empty() {
+        return Err("repo name required".to_string());
     }
+    // TODO: check remote via SSH if repo already exists on server - stub for now
     let mut username = prompt("username");
-    let mut server = prompt("server");
+    let mut server = prompt("server [127.0.0.1:8081 / raspi.local]");
+    let ssh_key = prompt("ssh key path [~/.ssh/id_ed25519]");
 
     if username.is_empty() {
         username = "loki".to_string();
-        println!("username: loki");
+        println!("username: loki (default)");
     } else {
         println!("username: {}", username);
     }
-
     if server.is_empty() {
-        server = "raspi.local".to_string();
-        println!("server: wasnt given so im using the default");
+        server = "127.0.0.1:8081".to_string();
+        println!("server: 127.0.0.1:8081 (default, T420 local)");
     } else {
         println!("server: {}", server);
     }
+    let ssh_key = if ssh_key.is_empty() { "~/.ssh/id_ed25519".to_string() } else { ssh_key };
 
-    //lemme show you the summary
-    println!(
-        "\n summary: repo={} \n username={} \n server={}",
-        repo, username, server
-    );
+    println!("\n summary: repo={} username={} server={} ssh={}", repo, username, server, ssh_key);
 
-    createRepo(&repo, &username, &server);
+    // create dirs - pure, no unwrap
+    fs::create_dir_all(".gyt").map_err(|e| format!("create .gyt: {e}"))?;
+    fs::create_dir_all(repo::stages_root()).map_err(|e| format!("create stages: {e}"))?;
+    fs::create_dir_all(repo::current_root()).map_err(|e| format!("create current: {e}"))?;
+    fs::create_dir_all(repo::commits_root()).map_err(|e| format!("create commits: {e}"))?;
 
-    std::process::exit(0);
+    let cfg = Config {
+        repo: RepoSection { name: repo.clone(), username: username.clone(), server: server.clone() },
+        client: None,
+        ignore: Some(IgnoreSection { files: vec![".gyt/".to_string(), "target/".to_string(), ".git/".to_string(), "gyat-server-data/".to_string(), "server.toml".to_string()] }),
+        ssh: Some(SshSection { key_path: ssh_key }),
+        server: None,
+    };
+    let s = toml::to_string_pretty(&cfg).map_err(|e| format!("serialize config: {e}"))?;
+    fs::write(".gyt/config.toml", s).map_err(|e| format!("write config: {e}"))?;
+    fs::write(repo::head_path(), "").map_err(|e| format!("write HEAD: {e}"))?;
+
+    println!("initialized gyat repo `{}`", cfg.repo.name);
+    println!("  config: .gyt/config.toml");
+    println!("  stages: .gyt/stages/");
+    println!("  commits: .gyt/commits/");
+    println!("  HEAD: .gyt/HEAD");
+    println!("next: `gyat add <files>` then `gyat commit -m \"msg\"` (+ `gyat push` for remote)");
+    Ok(())
 }

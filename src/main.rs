@@ -3,10 +3,9 @@ use clap::{Parser, Subcommand};
 mod utils;
 use utils::init::init;
 use utils::status::status;
-use utils::add::add;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "gyat - T420-ready, add/commit local, push remote (SSH)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -16,12 +15,23 @@ struct Cli {
 enum Commands {
     Init,
     Status,
+    Log,
     Add {
         files: Vec<String>,
     },
     Ignore,
+    IgnoreAdd {
+        pattern: String,
+    },
+    Commit {
+        #[arg(short, long)]
+        message: String,
+    },
     Push,
-    Pull,
+    Pull {
+        commit: Option<String>,
+    },
+    #[command(alias = "goto", alias = "go")]
     Travel {
         commit: String,
     },
@@ -39,45 +49,47 @@ enum SnipSub {
         #[arg(long)]
         end: String,
     },
+    /// range syntax: gyat snip abc..def
+    Range {
+        range: String,
+    },
 }
 
-fn main() -> std::io::Result<()> {
+fn main() {
     let cli = Cli::parse();
-    if let Some(command) = &cli.command {
-        match command {
-            Commands::Init => {
-                init();
-            }
-            Commands::Status => {
-                status();
-            }
-            Commands::Add { files } => {
-                add(files);
-            }
-            Commands::Travel { commit } => {
-                println!("traveling to commit={commit}")
-            }
-            Commands::Ignore => {
-                println!("ignore")
-            }
-            Commands::Push => {
-                println!("push")
-            }
-            Commands::Pull => {
-                println!("pull")
-            }
-            Commands::Snip(snip_sub) => match snip_sub {
-                SnipSub::Top => {
-                    println!("top")
+    let res = match cli.command {
+        Some(Commands::Init) => init(),
+        Some(Commands::Status) => status(),
+        Some(Commands::Log) => utils::log::log(),
+        Some(Commands::Add { files }) => utils::add::add(&files),
+        Some(Commands::Ignore) => utils::ignore::ignore_show(),
+        Some(Commands::IgnoreAdd { pattern }) => utils::ignore::ignore_add(&pattern),
+        Some(Commands::Commit { message }) => utils::commit::create_commit(message).map(|h| { println!("committed {h}"); }),
+        Some(Commands::Push) => utils::push::push_remote(),
+        Some(Commands::Pull { commit }) => utils::pull::pull(commit),
+        Some(Commands::Travel { commit }) => utils::travel::travel(&commit),
+        Some(Commands::Snip(snip_sub)) => match snip_sub {
+            SnipSub::Top => utils::snip::snip_top(),
+            SnipSub::Bottom => utils::snip::snip_bottom(),
+            SnipSub::Commit { start, end } => utils::snip::snip_commit(&start, &end),
+            SnipSub::Range { range } => {
+                let parts: Vec<&str> = range.split("..").collect();
+                if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                    Err(format!("invalid range '{range}', expected START..END"))
+                } else {
+                    utils::snip::snip_commit(parts[0], parts[1])
                 }
-                SnipSub::Bottom => {
-                    println!("bottom")
-                }
-                SnipSub::Commit { start, end } => {
-                    println!("commit: start={:?} end={:?}", start, end)
-                }
-            },
+            }
+        },
+        None => {
+            println!("gyat - try `gyat --help`");
+            println!("  init, add, commit -m \"msg\", push (remote), status, log, travel/goto <hash>, snip");
+            Ok(())
         }
+    };
+
+    if let Err(e) = res {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
-    Ok(())
 }

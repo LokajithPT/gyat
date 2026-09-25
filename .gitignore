@@ -1,3 +1,16 @@
 /target
+/target
+/delta/target
+/server/target
+/gyat-server-data
+/server.toml
+.some_*
+*_delta
+.someother*
+.some
+some.txt
+.someother.txt
+.gyt/
+
 
 
