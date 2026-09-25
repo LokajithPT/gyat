@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
-use std::fs;
 
 mod utils;
 use utils::init::init;
+use utils::status::status;
+use utils::add::add;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -15,6 +16,9 @@ struct Cli {
 enum Commands {
     Init,
     Status,
+    Add {
+        files: Vec<String>,
+    },
     Ignore,
     Push,
     Pull,
@@ -45,7 +49,10 @@ fn main() -> std::io::Result<()> {
                 init();
             }
             Commands::Status => {
-                println!("status")
+                status();
+            }
+            Commands::Add { files } => {
+                add(files);
             }
             Commands::Travel { commit } => {
                 println!("traveling to commit={commit}")

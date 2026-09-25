@@ -1,10 +1,9 @@
 the main idea ... 
 
 
--------------------------------------------------------------------------------------------------------------------------
 so in the first place we are looking at organising to a point so that it works by getting the info from the config files 
 
--------------------------------------------------------------------------------------------------------------------------
+---
 
 -> the first thing is that we need 2 config files 
    ->  one for the server and one for the client 
@@ -43,10 +42,7 @@ files = ["something.txt", "dir/"]
 ```
 
 
------------------------------------------------------------------------------------------------------------------------------------------------------
-now we will talk about the deltas and shit ... 
------------------------------------------------------------------------------------------------------------------------------------------------------
-
+deltas and shit 
 
 the main idea here which i really need is that there should be something like stages and then deltas ... this will exist in both the local and remote
 
@@ -81,3 +77,7 @@ this will be good ... just for now .. and we can take it from here
 ---------------------------------------------------------------------------------------------------------------------------
 so now all i need is the thing which should i start coding with ... i need a flow thingy in here ... i need to make this as good as possible before it goes out to the raspberry pi
 ---------------------------------------------------------------------------------------------------------------------------
+
+---
+some
+---
