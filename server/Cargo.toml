@@ -7,4 +7,5 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-delta = { path = "../delta" }
+walkdir = "2"
+gyat-bundle = { path = "../bundle" }

@@ -1,6 +1,16 @@
-
 [repo]
-name = "something"
-username = "some"
-server = "raspi.local"
-    
+name = "gyat"
+username = "loki"
+server = "127.0.0.1:8081"
+
+[ignore]
+files = [
+    ".gyt/",
+    "target/",
+    ".git/",
+    "gyat-server-data/",
+    "server.toml",
+]
+
+[ssh]
+key_path = "~/.ssh/id_ed25519"

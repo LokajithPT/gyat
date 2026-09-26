@@ -1,0 +1,17 @@
+# gyat ignore - like .gitignore
+# dir/ matches that dir ANYWHERE (root or nested)
+.gyt/
+target/
+.git/
+node_modules/
+gyat-server-data/
+server.toml
+gyat
+gyat-server
+*.delta
+*.log
+# js builds
+dist/
+build/
+.next/
+# add more

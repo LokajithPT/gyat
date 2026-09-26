@@ -1,0 +1,14 @@
+[repo]
+name = "gyat"
+
+[compression]
+enabled = true
+algorithm = "gzip"
+level = 6
+
+[chunks]
+size = 4096
+
+[server]
+host = ""
+port = 0
