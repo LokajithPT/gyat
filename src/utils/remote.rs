@@ -135,6 +135,7 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+#[derive(Clone)]
 pub struct SshTarget {
     pub user: Option<String>,
     pub host: String,

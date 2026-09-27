@@ -730,6 +730,100 @@ fn ssh_push_rejects_non_fast_forward() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// `snip top` must move the current branch to *its own* parent. It used to
+/// fall back to "newest remaining commit", which silently repointed a branch
+/// at another branch's tip whenever that tip was newer.
+#[test]
+fn snip_top_moves_head_to_own_parent_not_another_branch() {
+    let dir = fresh_dir("sniptop");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo6", server.to_str().unwrap()).ok);
+
+    fs::write(dir.join("f.txt"), "a\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+    fs::write(dir.join("f.txt"), "b\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "second"], None).ok);
+
+    assert!(run(&dir, &["branch", "side"], None).ok);
+    assert!(run(&dir, &["travel", "side"], None).ok);
+    fs::write(dir.join("s.txt"), "s\n").unwrap();
+    assert!(run(&dir, &["add", "s.txt"], None).ok);
+    assert!(run(&dir, &["commit", "side tip"], None).ok);
+
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    let main_before = branch_hash(&dir, "main");
+    let side = branch_hash(&dir, "side");
+
+    let o = run(&dir, &["snip", "top"], None);
+    assert!(o.ok, "snip top failed: {}", o.text);
+    let main_after = branch_hash(&dir, "main");
+    assert_ne!(main_after, main_before, "snip top should move main off its tip");
+    assert_ne!(main_after, side, "main was repointed at the side branch tip");
+    // main must still be on the mainline: no side-only file
+    assert!(!dir.join("s.txt").exists(), "main should not have the side branch's file");
+    // snip top is a soft reset: refs move, the working tree is left alone.
+    assert_eq!(read(&dir.join("f.txt")), "b\n", "snip top should not touch the working tree");
+    let st = run(&dir, &["status"], None);
+    assert!(
+        st.text.contains("modified:   f.txt"),
+        "after a soft snip, f.txt should read as locally modified:\n{}",
+        st.text
+    );
+
+    // side must be untouched
+    assert_eq!(branch_hash(&dir, "side"), side, "snip top moved another branch");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A detached HEAD has no ref to name on the wire; pushing it used to send a
+/// literal "(detached)" ref that the server ignored while the client reported
+/// success. It must publish the real local branches instead.
+#[test]
+fn detached_push_publishes_local_branches() {
+    let root = fresh_dir("ssh-detached");
+    let shim = write_ssh_shim(&root);
+    let srv = root.join("srv");
+    fs::create_dir_all(&srv).unwrap();
+    let remote = format!("fakehost:{}/drepo", srv.display());
+
+    let a = root.join("a");
+    fs::create_dir_all(&a).unwrap();
+    assert!(init_repo(&a, "drepo", &remote).ok);
+    fs::write(a.join("f.txt"), "one\n").unwrap();
+    assert!(run_ssh(&a, &shim, &srv, &["add", "f.txt"], None).ok);
+    assert!(run_ssh(&a, &shim, &srv, &["commit", "one"], None).ok);
+    assert!(run_ssh(&a, &shim, &srv, &["branch", "feature"], None).ok);
+
+    let main_before = branch_hash(&a, "main");
+    let feature_before = branch_hash(&a, "feature");
+    // detach onto the root commit
+    let root_hash = {
+        let o = run_ssh(&a, &shim, &srv, &["log", "--oneline"], None);
+        o.text.lines().last().unwrap().split_whitespace().next().unwrap().to_string()
+    };
+    assert!(run_ssh(&a, &shim, &srv, &["travel", &root_hash], None).ok);
+    let head_file = read(&a.join(".gyt/HEAD")).trim().to_string();
+    assert!(head_file.starts_with(&root_hash), "HEAD should be detached, got {head_file}");
+
+    let o = run_ssh(&a, &shim, &srv, &["push"], None);
+    assert!(o.ok, "detached push failed: {}", o.text);
+    assert!(!o.text.contains("(detached) ->"), "should not push a bogus ref: {}", o.text);
+
+    // both branches must actually exist server-side now
+    let refs = srv.join("drepo/refs/heads");
+    assert!(refs.join("main").exists(), "main was not published: {}", o.text);
+    assert!(refs.join("feature").exists(), "feature was not published: {}", o.text);
+    assert_eq!(read(&refs.join("main")).trim(), main_before);
+    assert_eq!(read(&refs.join("feature")).trim(), feature_before);
+    assert!(!refs.join("(detached)").exists(), "a bogus (detached) ref was created");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn server_list_shows_branches() {
     let root = fresh_dir("ssh-list");

@@ -34,7 +34,7 @@ pub fn push_remote(force: bool) -> Result<(), String> {
     let head = super::repo::read_head();
     if head.is_none() { return Err("nothing to push: no commits. `gyat commit -m \"msg\"` first".to_string()); }
     let cfg = super::config::load().map_err(|e| format!("load config: {e}"))?;
-    let branch = super::repo::current_branch().unwrap_or_else(|| "(detached)".to_string());
+    let branch = super::repo::current_branch();
     let head_hash = head.unwrap_or_default();
 
     // resolve destination: full remote as-is, empty/bare word via static config
@@ -43,7 +43,10 @@ pub fn push_remote(force: bool) -> Result<(), String> {
             let key = super::host::effective_key(cfg.ssh.as_ref().map(|s| s.key_path.as_str()));
             let key = super::remote::expand_tilde(&key);
             let target = super::remote::SshTarget { user, host, port, key_path: Some(key) };
-            return push_ssh(&branch, &head_hash, target, &path, force);
+            return match branch {
+                Some(b) => push_ssh(&b, &head_hash, target, &path, force),
+                None => push_all_ssh(target, &path, force),
+            };
         }
         super::remote::Remote::Path(_) => {}
     }
@@ -84,13 +87,11 @@ pub fn push_remote(force: bool) -> Result<(), String> {
                 println!("pushed branch {name} -> {local_hash}");
             }
         }
-        // also handle detached HEAD? push current HEAD if detached
-        if branch == "(detached)" {
-            let server_head = server_path.join("HEAD");
-            fs::write(server_head, &head_hash).map_err(|e| format!("write server HEAD: {e}"))?;
-        }
+        // Detached HEAD has no ref of its own; the branches above are the refs
+        // that exist, so they are what gets published.
+        let label = branch.as_deref().unwrap_or("(detached: all branches)");
 
-        println!("push to {} done: {pushed_commits} commits, {pushed_branches} branches ({} -> {})", server_path.display(), branch, cfg.repo.server);
+        println!("push to {} done: {pushed_commits} commits, {pushed_branches} branches ({label} -> {})", server_path.display(), &head_hash[..8.min(head_hash.len())]);
         // also update gyat.toml server host if needed
         return Ok(());
     }
@@ -101,6 +102,27 @@ pub fn push_remote(force: bool) -> Result<(), String> {
         "cannot push: server `{}` is neither a path nor an ssh destination\n(hint: use a path like ./gyat-server-data, or user@host:/path, or ssh://host/path)",
         cfg.repo.server
     ))
+}
+
+/// Detached HEAD has no branch of its own to name on the wire, so publish every
+/// local branch instead. Sending a literal "(detached)" ref made the server
+/// silently ignore the push while the client still reported success.
+fn push_all_ssh(
+    target: super::remote::SshTarget,
+    path: &str,
+    force: bool,
+) -> Result<(), String> {
+    let branches = super::repo::list_branches();
+    if branches.is_empty() {
+        return Err("HEAD is detached and there are no branches to push\n(hint: `gyat travel <branch>` to attach HEAD)".to_string());
+    }
+    println!("HEAD is detached - pushing all {} local branch(es)", branches.len());
+    for b in branches {
+        if let Some(hash) = super::repo::read_branch(&b) {
+            push_ssh(&b, &hash, target.clone(), path, force)?;
+        }
+    }
+    Ok(())
 }
 
 fn push_ssh(
