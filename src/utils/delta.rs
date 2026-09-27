@@ -4,6 +4,21 @@ pub enum Delta {
     Delete { line: usize },
 }
 
+/// Ceiling on the backtracking trace. The naive trace costs
+/// `(D+1) * (2*(N+M)+1) * 4` bytes, which blows up quadratically on heavily
+/// rewritten large files (a 10k-line full rewrite wanted ~3 GB). We keep the
+/// minimal Myers diff for normal cases and fall back to a valid
+/// delete-all/insert-all delta once the trace would exceed this budget.
+const TRACE_BYTE_BUDGET: usize = 48 * 1024 * 1024;
+
+/// Valid, non-minimal delta: replace the whole region.
+/// Deletes every old line, then inserts every new line at position 0.
+fn replace_all(old: &[String], new: &[String]) -> Vec<Delta> {
+    let mut out: Vec<Delta> = (0..old.len()).map(|i| Delta::Delete { line: i }).collect();
+    out.extend(new.iter().map(|t| Delta::Insert { line: 0, text: t.clone() }));
+    out
+}
+
 /// Myers O(ND) - lightweight, no extra deps.
 ///
 /// Invariant: `line` is always an OLD-coordinate index (position in `old`
@@ -33,7 +48,14 @@ pub fn myers_diff(old: &[String], new: &[String]) -> Vec<Delta> {
     let mut v = vec![0i32; size];
     let mut trace: Vec<Vec<i32>> = Vec::new();
     let mut d_found = 0i32;
+    let row_bytes = size * std::mem::size_of::<i32>();
     'outer: for d in 0..=max as i32 {
+        // Bail out before the trace can blow past the budget: a rewrite-heavy
+        // large file would otherwise allocate gigabytes. The fallback is still
+        // a correct delta, just not minimal.
+        if trace.len().saturating_add(1).saturating_mul(row_bytes) > TRACE_BYTE_BUDGET {
+            return replace_all(old, new);
+        }
         for k in (-d..=d).step_by(2) {
             let k_offset = (k + offset) as usize;
             let mut x = if k == -d || (k != d && v[(k - 1 + offset) as usize] < v[(k + 1 + offset) as usize]) {
@@ -215,5 +237,40 @@ mod tests {
         assert_eq!(apply_deltas(&a, &d), b);
         assert_eq!(d.len(), a.len() + b.len() - 2 * lcs_len(&a, &b));
         let _ = std::mem::replace(&mut a, vec![]);
+    }
+
+    #[test]
+    fn large_full_rewrite_stays_bounded_and_correct() {
+        // Regression: the backtracking trace is (D+1)*(2*(N+M)+1)*4 bytes, so a
+        // 10k-line full rewrite used to allocate ~3 GB. It must now stay bounded
+        // while still producing a delta that reconstructs `new` exactly.
+        let n = 20_000usize;
+        let a: Vec<String> = (0..n).map(|i| format!("line {i}")).collect();
+        let b: Vec<String> = (0..n).map(|i| format!("COMPLETELY DIFFERENT {i}")).collect();
+        let d = myers_diff(&a, &b);
+        assert_eq!(apply_deltas(&a, &d), b, "fallback delta must still roundtrip");
+        // it fell back (not minimal) rather than exploding
+        assert!(d.len() > n, "expected non-minimal replace-all fallback");
+    }
+
+    #[test]
+    fn large_small_edit_still_minimal() {
+        // The budget must not degrade ordinary large-file edits.
+        let n = 20_000usize;
+        let a: Vec<String> = (0..n).map(|i| format!("line {i}")).collect();
+        let mut b = a.clone();
+        b[10_000] = "ONE LINE CHANGED".to_string();
+        let d = myers_diff(&a, &b);
+        assert_eq!(apply_deltas(&a, &d), b);
+        assert_eq!(d.len(), 2, "a single-line change should be 2 ops, got {}", d.len());
+    }
+
+    #[test]
+    fn binary_like_no_newlines_is_bounded() {
+        // one giant line that changes completely
+        let a = vec!["a".repeat(200_000)];
+        let b = vec!["b".repeat(200_000)];
+        let d = myers_diff(&a, &b);
+        assert_eq!(apply_deltas(&a, &d), b);
     }
 }

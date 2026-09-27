@@ -32,8 +32,14 @@ struct Out {
 }
 
 fn run(dir: &Path, args: &[&str], stdin: Option<&str>) -> Out {
+    // Hermetic by default: never read the developer's real ~/.gyatconfig.toml,
+    // and never let a test reach a real remote.
+    let fake_home = dir.join(".fakehome");
+    let _ = fs::create_dir_all(&fake_home);
     let mut cmd = Command::new(bin());
     cmd.current_dir(dir).args(args);
+    cmd.env("HOME", &fake_home);
+    cmd.env("GYAT_CONFIG", fake_home.join("no-static.toml"));
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }
@@ -419,12 +425,55 @@ exec "$GYAT_FAKE_SERVER_BIN" "$@"
     shim
 }
 
-fn run_ssh(dir: &Path, shim: &Path, server: &Path, args: &[&str], stdin: Option<&str>) -> Out {
+fn run_ssh(dir: &Path, shim: &Path, _server: &Path, args: &[&str], stdin: Option<&str>) -> Out {
+    run_ssh_env(dir, shim, None, args, stdin)
+}
+
+/// Run with an isolated HOME and no static config (hermetic: never reads
+/// the real ~/.gyatconfig.toml). Per-child env: race-free.
+fn run_iso(dir: &Path, args: &[&str], stdin: Option<&str>) -> Out {
+    let fake_home = dir.join(".fakehome");
+    let _ = fs::create_dir_all(&fake_home);
+    let mut cmd = Command::new(bin());
+    cmd.current_dir(dir).args(args);
+    cmd.env("HOME", &fake_home);
+    cmd.env("GYAT_CONFIG", fake_home.join("no-static.toml"));
+    if stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn gyat");
+    if let Some(input) = stdin {
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Out {
+        ok: out.status.success(),
+        text,
+    }
+}
+
+fn run_ssh_env(
+    dir: &Path,
+    shim: &Path,
+    home: Option<&Path>,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> Out {
     let mut cmd = Command::new(bin());
     cmd.current_dir(dir).args(args);
     cmd.env("GYAT_SSH_BIN", shim);
     cmd.env("GYAT_FAKE_SERVER_BIN", server_bin());
-    let _ = server;
+    if let Some(h) = home {
+        cmd.env("HOME", h);
+    }
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
     }
@@ -558,6 +607,171 @@ fn server_list_shows_branches() {
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(text.contains("main"), "unexpected list output: {text}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn static_config_means_no_urls_ever() {
+    // `gyat setup` once, then bare `push` / `pull` / `clone <name>`.
+    let root = fresh_dir("static");
+    let shim = write_ssh_shim(&root);
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let srvbase = root.join("srvbase");
+    fs::create_dir_all(&srvbase).unwrap();
+
+    // non-interactive setup
+    let o = run_ssh_env(
+        &root,
+        &shim,
+        Some(&home),
+        &[
+            "setup",
+            "--host",
+            "fakehost",
+            "--user",
+            "testwater",
+            "--base",
+            srvbase.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(o.ok, "setup failed: {}", o.text);
+    let cfg = read(&home.join(".gyatconfig.toml"));
+    assert!(cfg.contains("fakehost"), "unexpected config:\n{cfg}");
+    assert!(cfg.contains("testwater"), "unexpected config:\n{cfg}");
+
+    // init with EMPTY server -> static
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let o = run_ssh_env(&repo, &shim, Some(&home), &["init"], Some("staticrepo\nloki\n\n\n"));
+    assert!(o.ok, "init failed: {}", o.text);
+    let cfg_toml = read(&repo.join(".gyt/config.toml"));
+    assert!(
+        !cfg_toml.contains("fakehost"),
+        "repo config should stay bare/static, got:\n{cfg_toml}"
+    );
+
+    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    assert!(run_ssh_env(&repo, &shim, Some(&home), &["add", "a.txt"], None).ok);
+    assert!(run_ssh_env(&repo, &shim, Some(&home), &["commit", "init"], None).ok);
+
+    // bare push: no URL anywhere
+    let o = run_ssh_env(&repo, &shim, Some(&home), &["push"], None);
+    assert!(o.ok, "static push failed: {}", o.text);
+    assert!(o.text.contains("ok: received"), "unexpected: {}", o.text);
+    assert!(srvbase.join("staticrepo/commits").exists());
+
+    // bare clone by name
+    let o = run_ssh_env(&root, &shim, Some(&home), &["clone", "staticrepo", "cl"], None);
+    assert!(o.ok, "static clone failed: {}", o.text);
+    assert_eq!(read(&root.join("cl/a.txt")), "a\n");
+
+    // advance clone, bare push, bare pull in original
+    fs::write(root.join("cl/b.txt"), "b\n").unwrap();
+    assert!(run_ssh_env(&root.join("cl"), &shim, Some(&home), &["add", "b.txt"], None).ok);
+    assert!(run_ssh_env(&root.join("cl"), &shim, Some(&home), &["commit", "more"], None).ok);
+    assert!(run_ssh_env(&root.join("cl"), &shim, Some(&home), &["push"], None).ok);
+    let o = run_ssh_env(&repo, &shim, Some(&home), &["pull"], None);
+    assert!(o.ok, "static pull failed: {}", o.text);
+    assert!(run_ssh_env(&repo, &shim, Some(&home), &["travel", "main"], None).ok);
+    assert_eq!(read(&repo.join("b.txt")), "b\n");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_repos_and_branches_over_static() {
+    let root = fresh_dir("list-static");
+    let shim = write_ssh_shim(&root);
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let srvbase = root.join("srvbase");
+    fs::create_dir_all(&srvbase).unwrap();
+
+    let o = run_ssh_env(
+        &root,
+        &shim,
+        Some(&home),
+        &[
+            "setup",
+            "--host",
+            "fakehost",
+            "--user",
+            "testwater",
+            "--base",
+            srvbase.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(o.ok, "setup failed: {}", o.text);
+
+    // two repos on the server
+    for name in ["one", "two"] {
+        let repo = root.join(name);
+        fs::create_dir_all(&repo).unwrap();
+        let o = run_ssh_env(&repo, &shim, Some(&home), &["init"], Some(&format!("{name}\nloki\n\n\n")));
+        assert!(o.ok, "init failed: {}", o.text);
+        fs::write(repo.join("f.txt"), "x\n").unwrap();
+        assert!(run_ssh_env(&repo, &shim, Some(&home), &["add", "f.txt"], None).ok);
+        assert!(run_ssh_env(&repo, &shim, Some(&home), &["commit", "init"], None).ok);
+        let o = run_ssh_env(&repo, &shim, Some(&home), &["push"], None);
+        assert!(o.ok, "push failed: {}", o.text);
+    }
+    // extra branch on "one", pushed too
+    let one = root.join("one");
+    assert!(run_ssh_env(&one, &shim, Some(&home), &["branch", "feat"], None).ok);
+    let o = run_ssh_env(&one, &shim, Some(&home), &["push"], None);
+    assert!(o.ok, "push feat failed: {}", o.text);
+
+    // bare list: repos
+    let o = run_ssh_env(&root, &shim, Some(&home), &["list"], None);
+    assert!(o.ok, "list failed: {}", o.text);
+    assert!(o.text.contains("one"), "unexpected: {}", o.text);
+    assert!(o.text.contains("two"), "unexpected: {}", o.text);
+
+    // list one repo: branches
+    let o = run_ssh_env(&root, &shim, Some(&home), &["list", "one"], None);
+    assert!(o.ok, "list one failed: {}", o.text);
+    assert!(o.text.contains("main"), "unexpected: {}", o.text);
+    assert!(o.text.contains("feat"), "unexpected: {}", o.text);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_path_mode() {
+    // path-mode server: list siblings + branches without ssh.
+    // isolated HOME: must never read the real ~/.gyatconfig.toml.
+    let root = fresh_dir("list-path");
+    let srv = root.join("srv");
+    fs::create_dir_all(&srv).unwrap();
+
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let init_input = format!("myrepo\nloki\n{}\n\n", srv.to_str().unwrap());
+    let o = run_iso(&repo, &["init"], Some(&init_input));
+    assert!(o.ok, "init failed: {}", o.text);
+    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    assert!(run_iso(&repo, &["add", "a.txt"], None).ok);
+    assert!(run_iso(&repo, &["commit", "init"], None).ok);
+    assert!(run_iso(&repo, &["push"], None).ok);
+
+    // from inside the repo: sibling repos
+    let o = run_iso(&repo, &["list"], None);
+    assert!(o.ok, "list failed: {}", o.text);
+    assert!(o.text.contains("myrepo"), "unexpected: {}", o.text);
+
+    // explicit repo path: branches
+    let o = run_iso(&repo, &["list", srv.join("myrepo").to_str().unwrap()], None);
+    assert!(o.ok, "list repo failed: {}", o.text);
+    assert!(o.text.contains("main"), "unexpected: {}", o.text);
+
+    // no static, outside any repo, no arg: clear error
+    let o = run_iso(&root, &["list"], None);
+    assert!(!o.ok, "should fail without static config");
+    assert!(o.text.contains("gyat setup"), "unexpected: {}", o.text);
 
     let _ = fs::remove_dir_all(&root);
 }

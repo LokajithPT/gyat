@@ -37,10 +37,13 @@ pub fn push_remote(force: bool) -> Result<(), String> {
     let branch = super::repo::current_branch().unwrap_or_else(|| "(detached)".to_string());
     let head_hash = head.unwrap_or_default();
 
-    // ssh destination?
-    match super::remote::parse_remote(&cfg.repo.server, &cfg.repo.name) {
+    // resolve destination: full remote as-is, empty/bare word via static config
+    match super::host::resolve(&cfg.repo.server, &cfg.repo.name)? {
         super::remote::Remote::Ssh { user, host, port, path } => {
-            return push_ssh(&cfg, &branch, &head_hash, user, host, port, path, force);
+            let key = super::host::effective_key(cfg.ssh.as_ref().map(|s| s.key_path.as_str()));
+            let key = super::remote::expand_tilde(&key);
+            let target = super::remote::SshTarget { user, host, port, key_path: Some(key) };
+            return push_ssh(&branch, &head_hash, target, &path, force);
         }
         super::remote::Remote::Path(_) => {}
     }
@@ -101,36 +104,21 @@ pub fn push_remote(force: bool) -> Result<(), String> {
 }
 
 fn push_ssh(
-    cfg: &super::config::Config,
     branch: &str,
     head_hash: &str,
-    user: Option<String>,
-    host: String,
-    port: Option<u16>,
-    path: String,
+    target: super::remote::SshTarget,
+    path: &str,
     force: bool,
 ) -> Result<(), String> {
-    let key = cfg.ssh.as_ref().map(|s| s.key_path.clone());
-    // expand ~ in key path for ssh -i
-    let key = key.map(|k| {
-        if let Some(rest) = k.strip_prefix("~/") {
-            if let Ok(home) = std::env::var("HOME") {
-                return format!("{home}/{rest}");
-            }
-        }
-        k
-    });
-    let target = super::remote::SshTarget { user: user.clone(), host: host.clone(), port, key_path: key };
-    let dest = match &user {
-        Some(u) => format!("{u}@{host}"),
-        None => host.clone(),
-    };
-    println!("pushing {branch} ({}) to {dest}:{path}", &head_hash[..8.min(head_hash.len())]);
+    let dest = target.label();
+    println!(
+        "pushing {branch} ({}) to {dest}:{path}",
+        &head_hash[..8.min(head_hash.len())]
+    );
 
     let bundle = super::remote::pack_local_repo()?;
     let extra: &[&str] = if force { &["--force"] } else { &[] };
-    let remote_cmd = super::remote::remote_cmd(&super::remote::server_bin(), "receive", &path, extra);
-    let out = target.run(&remote_cmd, Some(&bundle))?;
+    let out = target.run_server("receive", path, extra, Some(&bundle))?;
     let text = String::from_utf8_lossy(&out);
     for line in text.lines() {
         println!("remote: {line}");
@@ -138,6 +126,9 @@ fn push_ssh(
     if text.lines().any(|l| l.starts_with("rejected")) {
         return Err("push rejected by server (non-fast-forward; retry with `gyat push --force`)".to_string());
     }
-    println!("push to {dest}:{path} done ({branch} -> {})", &head_hash[..8.min(head_hash.len())]);
+    println!(
+        "push to {dest}:{path} done ({branch} -> {})",
+        &head_hash[..8.min(head_hash.len())]
+    );
     Ok(())
 }

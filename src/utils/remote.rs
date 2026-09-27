@@ -29,13 +29,14 @@ pub enum Remote {
     },
 }
 
-fn expand_tilde(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("~/") {
+/// Expand a leading `~/` to the user's home directory.
+pub fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{home}/{rest}");
         }
     }
-    s.to_string()
+    p.to_string()
 }
 
 /// Split `[user@]host` into (user, host). Returns None if empty.
@@ -130,11 +131,6 @@ pub fn parse_remote(server: &str, repo_name: &str) -> Remote {
     Remote::Path(path)
 }
 
-/// Server-side binary name; override with GYAT_SERVER_BIN (useful for tests).
-pub fn server_bin() -> String {
-    std::env::var("GYAT_SERVER_BIN").unwrap_or_else(|_| "gyat-server".to_string())
-}
-
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -147,12 +143,15 @@ pub struct SshTarget {
 }
 
 impl SshTarget {
-    fn dest(&self) -> String {
+    /// Human-readable `user@host` for messages.
+    pub fn label(&self) -> String {
         match &self.user {
-            Some(u) => format!("{u}@{}", self.host),
-            None => self.host.clone(),
+            Some(u) if !u.is_empty() => format!("{u}@{}", self.host),
+            _ => self.host.clone(),
         }
     }
+
+    fn dest(&self) -> String { self.label() }
 
     fn base_args(&self) -> Vec<String> {
         let mut args = vec![
@@ -209,6 +208,48 @@ impl SshTarget {
         }
         Ok(out.stdout)
     }
+
+    /// Like [`run`], but if the remote reports the server binary is missing,
+    /// retry with common absolute locations. Keeps non-interactive PATH gaps
+    /// (common on fresh boxes) from breaking push/pull/clone.
+    pub fn run_server(
+        &self,
+        sub: &str,
+        repo_path: &str,
+        extra: &[&str],
+        stdin_bytes: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        let bin = super::host::server_bin();
+        let cmd = remote_cmd(&bin, sub, repo_path, extra);
+        let first = self.run(&cmd, stdin_bytes);
+        match &first {
+            Err(e) if server_missing(e) => {
+                for cand in ["$HOME/.local/bin", "$HOME/bin", "/usr/local/bin"] {
+                    let alt = format!(
+                        "PATH={cand}:$PATH {}",
+                        remote_cmd(&format!("{cand}/{bin}"), sub, repo_path, extra)
+                    );
+                    if let Ok(out) = self.run(&alt, stdin_bytes) {
+                        return Ok(out);
+                    }
+                }
+                Err(format!(
+                    "{e}\n(hint: install the server on {} — `cargo install --path server` or scp target/release/gyat-server to ~/.local/bin/)",
+                    self.dest()
+                ))
+            }
+            _ => first,
+        }
+    }
+}
+
+/// True when an ssh failure looks like "remote command not found".
+fn server_missing(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    (e.contains("command not found")
+        || e.contains("no such file or directory")
+        || e.contains("not found"))
+        && e.contains("gyat-server")
 }
 
 /// Pack local `.gyt/commits` + `.gyt/refs` into a push bundle (in memory).

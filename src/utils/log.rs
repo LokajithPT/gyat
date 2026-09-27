@@ -39,7 +39,6 @@ pub fn log(oneline: bool) -> Result<(), String> {
     }
     let branches = super::repo::list_branches();
     let head = super::repo::read_head().unwrap_or_default();
-    let cur_branch = super::repo::current_branch().unwrap_or_default();
     for m in metas.iter().rev() {
         let short = &m.hash[..8.min(m.hash.len())];
         let mut decorations = vec![];
@@ -48,11 +47,7 @@ pub fn log(oneline: bool) -> Result<(), String> {
         }
         for b in &branches {
             if super::repo::read_branch(b).as_deref() == Some(&m.hash) {
-                if b == &cur_branch {
-                    decorations.push(format!("{b}"));
-                } else {
-                    decorations.push(format!("{b}"));
-                }
+                decorations.push(b.clone());
             }
         }
         let deco = if decorations.is_empty() { String::new() } else { format!(" ({})", decorations.join(", ")) };

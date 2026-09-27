@@ -14,7 +14,28 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Init,
+    /// Configure your static server once (host, user, base dir).
+    /// After this: just `gyat push`, `gyat pull`, `gyat clone <name>`.
+    Setup {
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        key: Option<String>,
+    },
     Status,
+    /// List repos on your server, or branches of one repo.
+    /// `gyat list` (repos) / `gyat list <repo>` (branches). No URLs with static config.
+    List {
+        repo: Option<String>,
+    },
+    /// Check the whole chain: static config, local repo, ssh, gyat-server.
+    Doctor,
     Log {
         #[arg(long)]
         oneline: bool,
@@ -85,7 +106,12 @@ fn main() {
     let cli = Cli::parse();
     let res = match cli.command {
         Some(Commands::Init) => init(),
+        Some(Commands::Setup { host, user, port, base, key }) => {
+            utils::setup::setup(host, user, port, base, key)
+        }
         Some(Commands::Status) => status(),
+        Some(Commands::List { repo }) => utils::list::list(repo),
+        Some(Commands::Doctor) => utils::doctor::doctor(),
         Some(Commands::Log { oneline }) => utils::log::log(oneline),
         Some(Commands::Add { files }) => utils::add::add(&files),
         Some(Commands::Ignore) => utils::ignore::ignore_show(),

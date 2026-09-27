@@ -366,6 +366,27 @@ pub fn load_meta(hash: &str) -> Result<CommitMeta, String> {
 pub fn list_metas() -> Vec<CommitMeta> {
     let mut out = vec![];
     for h in repo::list_commits() { if let Ok(m) = load_meta(&h) { out.push(m); } }
-    out.sort_by_key(|m| m.timestamp);
+    // Timestamps are second-resolution, so same-second commits tie. Sort by
+    // (timestamp, parent-chain depth) so a linear chain always orders
+    // root-first even inside one second — otherwise `snip top/bottom` can
+    // pick the wrong commit as "newest"/"oldest".
+    let depth = |m: &CommitMeta| -> usize {
+        let mut d = 0usize;
+        let mut cur = m.parent.clone();
+        let mut guard = 0usize;
+        while let Some(h) = cur {
+            d += 1;
+            guard += 1;
+            if guard > 100_000 { break; }
+            match load_meta(&h) {
+                Ok(pm) => cur = pm.parent,
+                Err(_) => break,
+            }
+        }
+        d
+    };
+    out.sort_by(|a, b| {
+        a.timestamp.cmp(&b.timestamp).then_with(|| depth(a).cmp(&depth(b)))
+    });
     out
 }

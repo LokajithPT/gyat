@@ -31,9 +31,46 @@ pub fn clone_repo(source: &str, dest: Option<String>) -> Result<(), String> {
         return clone_ssh(user, host, port, path, repo_name, dest);
     }
 
+    // bare word + static configured: static wins over any local dir
+    // with the same name (use ./name to force a local source).
+    let is_bare = !source.contains('/') && !source.contains(':');
+    if is_bare && super::host::load().is_some() {
+        match super::host::resolve(source, source)? {
+            super::remote::Remote::Ssh { user, host, port, path } => {
+                let repo_name = Path::new(path.trim_end_matches('/'))
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(source)
+                    .to_string();
+                return clone_ssh(user, host, port, path, repo_name, dest);
+            }
+            // static exists but resolve gave a path: fall through to local
+            super::remote::Remote::Path(_) => {}
+        }
+    }
+
     let src_path = Path::new(source);
     if !src_path.exists() {
-        return Err(format!("clone source {} not found (try ./gyat-server-data/<repo>)", source));
+        // bare name? resolve via static server (`gyat clone myrepo`).
+        if !source.contains('/') && !source.contains(':') {
+            match super::host::resolve(source, source)? {
+                super::remote::Remote::Ssh { user, host, port, path } => {
+                    let repo_name = Path::new(path.trim_end_matches('/'))
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(source)
+                        .to_string();
+                    return clone_ssh(user, host, port, path, repo_name, dest);
+                }
+                super::remote::Remote::Path(p) if p.exists() => {
+                    return clone_repo(p.to_str().unwrap_or(source), dest);
+                }
+                _ => {}
+            }
+        }
+        return Err(format!("clone source {source} not found\n(hint: ./gyat-server-data/<repo>, user@host:/path, or `gyat setup` + `gyat clone <name>`)"));
     }
     // determine repo name from source path
     let repo_name = src_path.file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string();
@@ -79,14 +116,15 @@ fn clone_ssh(
     let dest_label = dest_path.display().to_string();
     fs::create_dir_all(&dest_path).map_err(|e| format!("mkdir dest: {e}"))?;
     let r = (|| -> Result<(), String> {
-        let target = super::remote::SshTarget { user: user.clone(), host: host.clone(), port, key_path: None };
+        let key = super::host::effective_key(None);
+        let key = super::remote::expand_tilde(&key);
+        let target = super::remote::SshTarget { user: user.clone(), host: host.clone(), port, key_path: Some(key) };
         let dest_label_ssh = match &user {
             Some(u) => format!("{u}@{host}:{path}"),
             None => format!("{host}:{path}"),
         };
         println!("cloning {dest_label_ssh} ...");
-        let remote_cmd = super::remote::remote_cmd(&super::remote::server_bin(), "fetch", &path, &[]);
-        let bytes = target.run(&remote_cmd, None)?;
+        let bytes = target.run_server("fetch", &path, &[], None)?;
         let tmp = super::remote::unpack_bundle_to_temp(&bytes)?;
         let r = build_from_dirs(
             &tmp.join("commits"),

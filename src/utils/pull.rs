@@ -69,32 +69,22 @@ fn ingest(server_commits: &Path, server_refs: &Path, label: &str) -> Result<(), 
 }
 
 fn pull_ssh(cfg: &super::config::Config, commit: Option<String>) -> Result<(), String> {
-    let (user, host, port, path) = match super::remote::parse_remote(&cfg.repo.server, &cfg.repo.name) {
+    let (user, host, port, path) = match super::host::resolve(&cfg.repo.server, &cfg.repo.name)? {
         super::remote::Remote::Ssh { user, host, port, path } => (user, host, port, path),
         _ => return Err("internal: expected ssh remote".to_string()),
     };
-    let key = cfg.ssh.as_ref().map(|s| {
-        let k = &s.key_path;
-        if let Some(rest) = k.strip_prefix("~/") {
-            if let Ok(home) = std::env::var("HOME") {
-                return format!("{home}/{rest}");
-            }
-        }
-        k.clone()
-    });
-    let target = super::remote::SshTarget { user: user.clone(), host: host.clone(), port, key_path: key };
+    let key = super::host::effective_key(cfg.ssh.as_ref().map(|s| s.key_path.as_str()));
+    let key = super::remote::expand_tilde(&key);
+    let target = super::remote::SshTarget { user: user.clone(), host: host.clone(), port, key_path: Some(key) };
     let dest = match &user {
         Some(u) => format!("{u}@{host}"),
         None => host.clone(),
     };
 
-    let remote_cmd = super::remote::remote_cmd(&super::remote::server_bin(), "fetch", &path, &[]);
-    println!("fetching from {dest}:{path}");
-    let bytes = target.run(&remote_cmd, None)?;
+    let bytes = target.run_server("fetch", &path, &[], None)?;
     // server prints progress to stderr; fetch bundle comes on stdout.
     // (over real ssh the streams stay separate; keep that contract here.)
-    let tmp = super::remote::unpack_bundle_to_temp(&bytes)?;
-    let r = ingest(&tmp.join("commits"), &tmp.join("refs/heads"), &format!("{dest}:{path}"));
+    let tmp = super::remote::unpack_bundle_to_temp(&bytes)?;    let r = ingest(&tmp.join("commits"), &tmp.join("refs/heads"), &format!("{dest}:{path}"));
     let _ = fs::remove_dir_all(&tmp);
     r?;
     if let Some(hash) = commit {
@@ -107,9 +97,9 @@ pub fn pull(commit: Option<String>) -> Result<(), String> {
     super::repo::ensure_repo()?;
     let cfg = super::config::load().map_err(|e| format!("load config: {e}"))?;
 
-    // ssh destination?
+    // ssh destination (full remote or static-resolved)?
     if matches!(
-        super::remote::parse_remote(&cfg.repo.server, &cfg.repo.name),
+        super::host::resolve(&cfg.repo.server, &cfg.repo.name)?,
         super::remote::Remote::Ssh { .. }
     ) {
         return pull_ssh(&cfg, commit);

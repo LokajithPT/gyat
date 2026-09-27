@@ -19,3 +19,7 @@ pub mod merge;
 pub mod clone;
 pub mod delta;
 pub mod remote;
+pub mod host;
+pub mod setup;
+pub mod list;
+pub mod doctor;

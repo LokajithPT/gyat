@@ -1,7 +1,7 @@
 [repo]
 name = "gyat"
 username = "loki"
-server = "127.0.0.1:8081"
+server = ""
 
 [ignore]
 files = [
