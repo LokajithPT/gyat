@@ -1017,3 +1017,197 @@ fn list_path_mode() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---- data-loss regressions -------------------------------------------------
+
+/// `snip bottom` used to remove the oldest commit without repairing refs, so a
+/// branch pointing at it was left dangling and `travel` on it failed.
+#[test]
+fn snip_bottom_repairs_branches_pointing_at_removed_commit() {
+    let dir = fresh_dir("snipbottom");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo7", server.to_str().unwrap()).ok);
+    fs::write(dir.join("f.txt"), "a\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+    // `side` points at the root commit, which is the oldest
+    assert!(run(&dir, &["branch", "side"], None).ok);
+    fs::write(dir.join("f.txt"), "b\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "second"], None).ok);
+
+    let o = run(&dir, &["snip", "bottom"], None);
+    assert!(o.ok, "snip bottom failed: {}", o.text);
+
+    // no branch may point at a commit that is gone
+    for b in ["main", "side"] {
+        if !branch_hash(&dir, b).is_empty() {
+            let h = branch_hash(&dir, b);
+            assert!(
+                dir.join(".gyt/commits").join(&h).exists(),
+                "branch {b} dangles at removed commit {h}"
+            );
+            let t = run(&dir, &["travel", b], None);
+            assert!(t.ok, "travel {b} failed after snip bottom: {}", t.text);
+        }
+    }
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    assert!(!run(&dir, &["status"], None).text.contains("snapshot missing"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `branch -d` used to delete unmerged work with no warning at all.
+#[test]
+fn branch_delete_refuses_unmerged_unless_forced() {
+    let dir = fresh_dir("brdel");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo8", server.to_str().unwrap()).ok);
+    fs::write(dir.join("f.txt"), "a\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+
+    assert!(run(&dir, &["branch", "work"], None).ok);
+    assert!(run(&dir, &["travel", "work"], None).ok);
+    fs::write(dir.join("precious.txt"), "hours of work\n").unwrap();
+    assert!(run(&dir, &["add", "precious.txt"], None).ok);
+    assert!(run(&dir, &["commit", "unmerged work"], None).ok);
+    assert!(run(&dir, &["travel", "main"], None).ok);
+
+    let o = run(&dir, &["branch", "-d", "work"], None);
+    assert!(!o.ok, "deleting an unmerged branch should be refused: {}", o.text);
+    assert!(o.text.contains("unmerged"), "{}", o.text);
+    assert!(dir.join(".gyt/refs/heads/work").exists(), "work branch was deleted anyway");
+
+    // -D is the explicit override
+    let o = run(&dir, &["branch", "-D", "work"], None);
+    assert!(o.ok, "-D should force the delete: {}", o.text);
+    assert!(!dir.join(".gyt/refs/heads/work").exists());
+
+    // a merged branch still deletes without -D
+    assert!(run(&dir, &["branch", "merged"], None).ok);
+    assert!(run(&dir, &["travel", "merged"], None).ok);
+    fs::write(dir.join("m.txt"), "m\n").unwrap();
+    assert!(run(&dir, &["add", "m.txt"], None).ok);
+    assert!(run(&dir, &["commit", "merged work"], None).ok);
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    let o = run(&dir, &["merge", "merged"], None);
+    assert!(o.ok, "merge failed: {}", o.text);
+    let o = run(&dir, &["branch", "-d", "merged"], None);
+    assert!(o.ok, "merged branch should delete with plain -d: {}", o.text);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A fast-forward merge used to check out the target branch, so you silently
+/// ended up on `feature` after `gyat merge feature`.
+#[test]
+fn fast_forward_merge_stays_on_the_current_branch() {
+    let dir = fresh_dir("ffbranch");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo9", server.to_str().unwrap()).ok);
+    fs::write(dir.join("f.txt"), "a\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+
+    assert!(run(&dir, &["branch", "feature"], None).ok);
+    assert!(run(&dir, &["travel", "feature"], None).ok);
+    fs::write(dir.join("g.txt"), "b\n").unwrap();
+    assert!(run(&dir, &["add", "g.txt"], None).ok);
+    assert!(run(&dir, &["commit", "feature work"], None).ok);
+    assert!(run(&dir, &["travel", "main"], None).ok);
+
+    let o = run(&dir, &["merge", "feature"], None);
+    assert!(o.ok, "merge failed: {}", o.text);
+    assert_eq!(
+        read(&dir.join(".gyt/HEAD")).trim(),
+        "ref: refs/heads/main",
+        "merge should leave you on main"
+    );
+    assert!(dir.join("g.txt").exists(), "fast-forward should update the working tree");
+    assert_eq!(branch_hash(&dir, "main"), branch_hash(&dir, "feature"));
+    let st = run(&dir, &["status"], None);
+    assert!(!st.text.contains("Changes not staged"), "{}", st.text);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `merge` used to overwrite uncommitted work during a fast-forward.
+#[test]
+fn merge_refuses_to_overwrite_uncommitted_work() {
+    let dir = fresh_dir("mergedirty");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo10", server.to_str().unwrap()).ok);
+    fs::write(dir.join("f.txt"), "a\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+
+    assert!(run(&dir, &["branch", "side"], None).ok);
+    assert!(run(&dir, &["travel", "side"], None).ok);
+    fs::write(dir.join("s.txt"), "s\n").unwrap();
+    assert!(run(&dir, &["add", "s.txt"], None).ok);
+    assert!(run(&dir, &["commit", "side work"], None).ok);
+    assert!(run(&dir, &["travel", "main"], None).ok);
+
+    fs::write(dir.join("f.txt"), "MY UNCOMMITTED WORK\n").unwrap();
+    let o = run(&dir, &["merge", "side"], None);
+    assert!(!o.ok, "merge overwrote uncommitted work: {}", o.text);
+    assert_eq!(read(&dir.join("f.txt")), "MY UNCOMMITTED WORK\n", "uncommitted edit was lost");
+    assert!(o.text.contains("uncommitted"), "{}", o.text);
+
+    // committing it first lets the merge through
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "save my work"], None).ok);
+    let o = run(&dir, &["merge", "side"], None);
+    assert!(o.ok, "merge should succeed once the tree is clean: {}", o.text);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Adding an empty file is a real change and must be counted as one.
+#[test]
+fn empty_file_commit_is_counted() {
+    let dir = fresh_dir("emptyfile");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo11", server.to_str().unwrap()).ok);
+    fs::write(dir.join("empty.txt"), "").unwrap();
+    assert!(run(&dir, &["add", "empty.txt"], None).ok);
+    let o = run(&dir, &["commit", "add empty"], None);
+    assert!(o.ok, "commit failed: {}", o.text);
+    assert!(
+        o.text.contains("1 file changed"),
+        "adding an empty file should count as 1 file changed, got: {}",
+        o.text
+    );
+    let st = run(&dir, &["status"], None);
+    assert!(!st.text.contains("new file"), "tree should be clean: {}", st.text);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `doctor` exited 0 even when a check failed, so a broken setup looked fine.
+#[test]
+fn doctor_exits_nonzero_when_a_check_fails() {
+    let dir = fresh_dir("doctorfail");
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("gc.toml"),
+        "[server]\nhost = \"127.0.0.1\"\nuser = \"nobody\"\nport = 2222\nbase = \"nope\"\nkey = \"~/.ssh/id_ed25519\"\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new(bin())
+        .current_dir(&dir)
+        .args(["doctor"])
+        .env("HOME", &home)
+        .env("GYAT_CONFIG", home.join("gc.toml"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "doctor should exit non-zero when ssh/server checks fail");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(text.contains("fail"), "expected a failing check, got:\n{text}");
+    let _ = fs::remove_dir_all(&dir);
+}

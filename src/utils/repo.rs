@@ -124,6 +124,44 @@ pub fn list_commits() -> Vec<String> {
     v
 }
 
+/// Tracked files whose worktree contents differ from HEAD's snapshot.
+///
+/// These are the files a checkout would silently overwrite. Untracked files
+/// are not at risk (a checkout never removes them) and are left out.
+pub fn dirty_tracked() -> Vec<String> {
+    let Some(head) = read_head() else { return vec![] };
+    let snap = commit_snapshot_root(&head);
+    if !snap.exists() { return vec![]; }
+    let mut out = vec![];
+    collect_dir(&snap, &snap, &mut out);
+    out.sort();
+    out.into_iter()
+        .filter_map(|rel| {
+            let key = rel.to_string_lossy().to_string();
+            let key = key.strip_suffix(".gz").map(|s| s.to_string()).unwrap_or(key);
+            let stored = snap.join(&rel);
+            let worktree = Path::new(".").join(&key);
+            let head_bytes = crate::utils::compression::read_bytes_maybe_compressed(&stored).ok()?;
+            match fs::read(&worktree) {
+                Ok(cur) if cur == head_bytes => None,
+                Ok(_) => Some(key),
+                // tracked but missing from the worktree: also a local change
+                Err(_) => Some(key),
+            }
+        })
+        .collect()
+}
+
+fn collect_dir(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() { collect_dir(root, &p, out); }
+            else if let Ok(rel) = p.strip_prefix(root) { out.push(rel.to_path_buf()); }
+        }
+    }
+}
+
 pub fn commit_path(hash: &str) -> PathBuf { commits_root().join(hash) }
 pub fn commit_meta_path(hash: &str) -> PathBuf { commit_path(hash).join("meta.toml") }
 pub fn commit_snapshot_root(hash: &str) -> PathBuf { commit_path(hash).join("snapshot") }

@@ -145,7 +145,10 @@ pub fn commit_with_message(message: String) -> Result<(), String> {
         let old_lines = if parent.as_ref().is_some() { read_lines_for_delta(&parent_file) } else { vec![] };
         let new_lines = read_lines_for_delta(&repo::stages_root().join(rel));
         let existed_before = parent.as_ref().map(|_| parent_file.exists() || std::path::PathBuf::from(format!("{}.gz", parent_file.display())).exists()).unwrap_or(false);
-        if old_lines == new_lines {
+        // Compare by *existence* as well as content: an empty file has zero
+        // lines both before and after, so a content-only comparison reported
+        // "0 files changed" for a commit that really did add a file.
+        if existed_before && old_lines == new_lines {
             continue;
         }
         let deltas = myers_diff(&old_lines, &new_lines);

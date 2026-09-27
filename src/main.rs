@@ -82,6 +82,9 @@ enum Commands {
         name: Option<String>,
         #[arg(short, long)]
         delete: bool,
+        /// delete even if the branch has unmerged commits
+        #[arg(short = 'D', long)]
+        force: bool,
         #[arg(short, long)]
         rename: Option<String>,
     },
@@ -131,15 +134,15 @@ fn main() {
         Some(Commands::Travel { commit }) => utils::travel::travel(&commit),
         Some(Commands::Merge { branch, message }) => utils::merge::merge_branch(&branch, message),
         Some(Commands::Clone { source, dest }) => utils::clone::clone_repo(&source, dest),
-        Some(Commands::Branch { name, delete, rename }) => {
+        Some(Commands::Branch { name, delete, force, rename }) => {
             if let Some(new) = rename {
                 match name {
                     Some(old) => utils::branch::rename(&old, &new),
                     None => Err("branch --rename <new> needs old name".to_string()),
                 }
-            } else if delete {
+            } else if delete || force {
                 match name {
-                    Some(n) => utils::branch::delete(&n),
+                    Some(n) => utils::branch::delete_with_force(&n, force),
                     None => Err("branch -d needs name".to_string()),
                 }
             } else if let Some(n) = name {

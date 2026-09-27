@@ -63,6 +63,17 @@ pub fn travel(commit_or_branch: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Restore `hash`'s tree into the working tree *without* moving HEAD.
+///
+/// A fast-forward merge needs exactly this: the branch ref moves, but you stay
+/// on the branch you merged into. Calling `travel` instead would check out the
+/// target branch and silently leave you there.
+pub fn checkout_tree_from(prev: Option<&str>, hash: &str) -> Result<(), String> {
+    let snap = repo::commit_snapshot_root(hash);
+    if !snap.exists() { return Err(format!("commit {hash} snapshot missing")); }
+    restore_snapshot_with_prev(prev, hash, &snap, &format!("updated working tree to {hash}"))
+}
+
 fn restore_snapshot_with_prev(prev: Option<&str>, target: &str, snap: &Path, msg: &str) -> Result<(), String> {
     sync_delete_extra(prev, snap);
     let files = collect_snapshot_files(snap);

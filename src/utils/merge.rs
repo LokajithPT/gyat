@@ -101,13 +101,32 @@ pub fn merge_branch(target_branch: &str, message: Option<String>) -> Result<(), 
     if cur_hash.is_empty() || tgt_hash.is_empty() { return Err("one of branches has no commits".to_string()); }
     if cur_hash == tgt_hash { println!("already up to date"); return Ok(()); }
 
+    // Refuse to start a merge that would overwrite uncommitted work. A
+    // fast-forward checkout restores the target snapshot over the worktree,
+    // which silently destroyed local edits.
+    let staged = super::repo::staged_files().len() + super::repo::staged_deletions().len();
+    let dirty = super::repo::dirty_tracked();
+    if staged > 0 || !dirty.is_empty() {
+        let mut what = String::new();
+        if staged > 0 { what.push_str(&format!("{staged} staged change(s)")); }
+        if !dirty.is_empty() {
+            if !what.is_empty() { what.push_str(", "); }
+            what.push_str(&format!("{} uncommitted file change(s)", dirty.len()));
+        }
+        return Err(format!(
+            "merge would overwrite uncommitted work: {what}\n\
+             hint: `gyat commit \"msg\"` to save it first, or `gyat status` to review"
+        ));
+    }
+
     let base = find_base(&cur_hash, &tgt_hash);
     // fast-forward check: if base == cur, we can fast-forward current to target
     if base.as_deref() == Some(&cur_hash) {
-        // fast-forward
+        // fast-forward: move the branch ref, then bring the working tree up to
+        // date. Stay on cur_branch - checking out the target branch instead
+        // left you on `feature` after `gyat merge feature`.
         super::repo::write_branch(&cur_branch, &tgt_hash)?;
-        // also update HEAD and restore snapshot
-        super::travel::travel(target_branch)?;
+        super::travel::checkout_tree_from(Some(&cur_hash), &tgt_hash)?;
         println!("fast-forward {cur_branch} -> {target_branch} ({tgt_hash})");
         return Ok(());
     }

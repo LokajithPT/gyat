@@ -42,7 +42,25 @@ pub fn create(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn delete(name: &str) -> Result<(), String> {
+/// True when `ancestor` is reachable by walking parents from `descendant`.
+fn is_ancestor(ancestor: &str, descendant: &str) -> bool {
+    let mut cur = descendant.to_string();
+    let mut guard = 0usize;
+    loop {
+        if cur == ancestor { return true; }
+        guard += 1;
+        if guard > 100_000 { return false; }
+        match super::commit::load_meta(&cur) {
+            Ok(m) => match m.parent {
+                Some(p) => cur = p,
+                None => return false,
+            },
+            Err(_) => return false,
+        }
+    }
+}
+
+pub fn delete_with_force(name: &str, force: bool) -> Result<(), String> {
     super::repo::ensure_repo()?;
     if !repo::branch_exists(name) {
         return Err(format!("error: branch '{name}' not found"));
@@ -52,9 +70,39 @@ pub fn delete(name: &str) -> Result<(), String> {
         return Err(format!("error: cannot delete checked out branch '{name}'\nhint: `gyat travel <other>` first"));
     }
     let hash = repo::read_branch(name).unwrap_or_default();
+    // Deleting a branch whose commits exist nowhere else destroys work, so
+    // require an explicit -D like git does.
+    if !force && !hash.is_empty() {
+        if let Some(cur_hash) = repo::read_head() {
+            if !is_ancestor(&hash, &cur_hash) {
+                let n = count_commits(&hash, &cur_hash);
+                return Err(format!(
+                    "error: branch '{name}' has {n} unmerged commit(s)\n\
+                     hint: `gyat branch -D {name}` to delete anyway"
+                ));
+            }
+        }
+    }
     fs::remove_file(repo::branch_path(name)).map_err(|e| format!("error: delete branch {name}: {e}"))?;
     println!("Deleted branch {name} (was {}).", if hash.is_empty() { "-" } else { &hash[..8.min(hash.len())] });
     Ok(())
+}
+
+/// Rough count of commits on `tip` that are not reachable from `other`.
+fn count_commits(tip: &str, other: &str) -> usize {
+    let mut n = 0usize;
+    let mut cur = tip.to_string();
+    let mut guard = 0usize;
+    while !is_ancestor(&cur, other) {
+        n += 1;
+        guard += 1;
+        if guard > 100_000 { break; }
+        match super::commit::load_meta(&cur).ok().and_then(|m| m.parent) {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    n
 }
 
 pub fn rename(old: &str, new: &str) -> Result<(), String> {

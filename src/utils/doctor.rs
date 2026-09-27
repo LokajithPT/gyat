@@ -8,7 +8,10 @@ fn ok(msg: &str) {
 fn warn(msg: &str) {
     println!("  warn  {msg}");
 }
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn bad(msg: &str) {
+    FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("  fail  {msg}");
 }
 
@@ -67,7 +70,7 @@ pub fn doctor() -> Result<(), String> {
             println!("ssh / server");
             println!();
             warn("skipped: no static server configured");
-            return Ok(());
+            return Err("doctor found problems (see above)".to_string());
         }
     };
     print!("ssh + server");
@@ -97,7 +100,7 @@ pub fn doctor() -> Result<(), String> {
             bad(&format!("ssh {dest}: {e}"));
             println!();
             println!("  check: tailscale status, the key, and that the box is online");
-            return Ok(());
+            return Err("doctor found problems (see above)".to_string());
         }
     }
     match target.run_server("list", &st.server.base, &[], None) {
@@ -111,6 +114,9 @@ pub fn doctor() -> Result<(), String> {
         Err(e) => bad(&format!("gyat-server: {e}")),
     }
     println!();
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("doctor found problems (see above)".to_string());
+    }
     println!("all good — `gyat push` / `gyat pull` / `gyat clone <name>` will just work");
     Ok(())
 }

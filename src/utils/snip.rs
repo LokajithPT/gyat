@@ -11,36 +11,69 @@ fn parent_map(doomed: &[String]) -> std::collections::HashMap<String, Option<Str
     m
 }
 
-/// Point the current branch (or a detached HEAD) at the first ancestor of
-/// `from` that survived the snip, keeping the branch/detached distinction.
-///
-/// Picking "the newest remaining commit" instead would move a branch onto an
-/// unrelated commit whenever another branch had a newer tip.
-fn relocate_head(from: &str, parents: &std::collections::HashMap<String, Option<String>>) -> Result<(), String> {
-    if !parents.contains_key(from) { return Ok(()); }
+/// First ancestor of `from` that survived the snip, or None if the whole
+/// chain was removed.
+fn first_surviving(from: &str, parents: &std::collections::HashMap<String, Option<String>>) -> Option<String> {
     let mut cur = from.to_string();
     let mut guard = 0usize;
     while parents.contains_key(&cur) {
         guard += 1;
-        if guard > 100_000 { break; }
+        if guard > 100_000 { return None; }
         match parents.get(&cur).cloned().flatten() {
             Some(next) => cur = next,
-            None => { cur.clear(); break; }
+            None => return None,
         }
     }
-    if cur.is_empty() || parents.contains_key(&cur) {
-        fs::write(repo::head_path(), "").map_err(|e| format!("clear HEAD: {e}"))?;
-        println!("no commits left");
-    } else {
-        // write_head updates the branch ref when HEAD is `ref: refs/heads/x`
-        // and rewrites the raw hash when detached, which is exactly the
-        // distinction we want to preserve.
-        repo::write_head(&cur)?;
-        if repo::current_branch().is_none() {
-            println!("HEAD now at {cur} (detached)");
-        } else {
-            println!("new HEAD {cur}");
+    Some(cur)
+}
+
+/// Point the current branch (or a detached HEAD) at the first ancestor of
+/// `from` that survived the snip, keeping the branch/detached distinction.
+fn relocate_head(from: &str, parents: &std::collections::HashMap<String, Option<String>>) -> Result<(), String> {
+    if !parents.contains_key(from) { return Ok(()); }
+    match first_surviving(from, parents) {
+        Some(cur) => {
+            // write_head updates the branch ref when HEAD is `ref: refs/heads/x`
+            // and rewrites the raw hash when detached, which is exactly the
+            // distinction we want to preserve.
+            repo::write_head(&cur)?;
+            if repo::current_branch().is_none() {
+                println!("HEAD now at {cur} (detached)");
+            } else {
+                println!("new HEAD {cur}");
+            }
         }
+        None => {
+            fs::write(repo::head_path(), "").map_err(|e| format!("clear HEAD: {e}"))?;
+            println!("no commits left");
+        }
+    }
+    Ok(())
+}
+
+/// Repair every ref that pointed into the snipped range, not just HEAD.
+///
+/// Repairing only HEAD left other branches dangling at a deleted commit, so
+/// `travel` on them failed with "snapshot missing" and their commits were
+/// unreachable. Branches whose entire history was removed are deleted.
+fn repair_refs(parents: &std::collections::HashMap<String, Option<String>>) -> Result<(), String> {
+    let head_before = repo::read_head();
+    for b in repo::list_branches() {
+        let Some(h) = repo::read_branch(&b) else { continue; };
+        if !parents.contains_key(&h) { continue; }
+        match first_surviving(&h, parents) {
+            Some(target) => {
+                repo::write_branch(&b, &target)?;
+                println!("branch {b} moved to {}", &target[..8.min(target.len())]);
+            }
+            None => {
+                let _ = fs::remove_file(repo::branch_path(&b));
+                println!("branch {b} deleted (all of its commits were snipped)");
+            }
+        }
+    }
+    if let Some(h) = head_before {
+        relocate_head(&h, parents)?;
     }
     Ok(())
 }
@@ -55,7 +88,7 @@ pub fn snip_top() -> Result<(), String> {
     if commit_dir.exists() {
         fs::remove_dir_all(&commit_dir).map_err(|e| format!("remove {head}: {e}"))?;
     }
-    relocate_head(&head, &parents)
+    repair_refs(&parents)
 }
 
 pub fn snip_bottom() -> Result<(), String> {
@@ -64,10 +97,12 @@ pub fn snip_bottom() -> Result<(), String> {
     if metas.is_empty() { return Err("no commits to snip".to_string()); }
     metas.sort_by_key(|m| m.timestamp);
     let oldest = metas.first().unwrap().hash.clone();
+    let parents = parent_map(std::slice::from_ref(&oldest));
     println!("snip bottom: removing oldest {oldest}");
     let dir = repo::commit_path(&oldest);
     fs::remove_dir_all(&dir).map_err(|e| format!("remove {oldest}: {e}"))?;
-    Ok(())
+    // other branches may have pointed at this commit
+    repair_refs(&parents)
 }
 
 pub fn snip_commit(start: &str, end: &str) -> Result<(), String> {
@@ -94,8 +129,5 @@ pub fn snip_commit(start: &str, end: &str) -> Result<(), String> {
     }
     // If HEAD pointed into the snipped range, move it to the first ancestor
     // that survived rather than to some unrelated remaining commit.
-    if let Some(head) = repo::read_head() {
-        relocate_head(&head, &parents)?;
-    }
-    Ok(())
+    repair_refs(&parents)
 }
