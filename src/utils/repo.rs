@@ -129,6 +129,137 @@ pub fn commit_meta_path(hash: &str) -> PathBuf { commit_path(hash).join("meta.to
 pub fn commit_snapshot_root(hash: &str) -> PathBuf { commit_path(hash).join("snapshot") }
 pub fn commit_deltas_root(hash: &str) -> PathBuf { commit_path(hash).join("deltas") }
 
+/// One `~n` / `^n` step parsed off the end of a revision expression.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Step {
+    /// `~n` — walk n first parents.
+    First(usize),
+    /// `^2` — the second parent of a merge commit.
+    Second,
+    /// `^3` and up: a commit can only have two parents, so this is an error.
+    TooDeep(usize),
+}
+
+/// Resolve a revision expression to a full commit hash.
+///
+/// The base may be `HEAD`, `@`, a branch name, or a full/abbreviated hash.
+/// It can be followed by any number of git-style ancestry operators:
+/// `~n` (n first parents), `^`/`^1` (first parent) and `^2` (merge's second
+/// parent). Operators apply left to right, so `HEAD~2^2` means "the second
+/// parent of the second commit back".
+pub fn resolve_rev(spec: &str) -> Result<String, String> {
+    let spec = spec.trim();
+    if spec.is_empty() { return Err("empty revision".to_string()); }
+    let (base, steps, complete) = split_steps(spec);
+    if !complete {
+        return Err(format!("revision `{spec}`: unrecognised trailing characters"));
+    }
+    if base.is_empty() {
+        return Err(format!(
+            "revision `{spec}` has no base before `{}`",
+            steps_label(&steps)
+        ));
+    }
+    let mut hash = resolve_base(&base)?;
+    for step in steps {
+        hash = apply_step(&hash, step, spec)?;
+    }
+    Ok(hash)
+}
+
+fn steps_label(steps: &[Step]) -> String {
+    steps.iter().map(|s| match s {
+        Step::First(n) => format!("~{n}"),
+        Step::Second => "^2".to_string(),
+        Step::TooDeep(n) => format!("^{n}"),
+    }).collect()
+}
+
+/// Split a revision into its base and its ancestry operators.
+///
+/// Scans left to right: the base is the leading run of characters that are
+/// not `~`/`^`, then each operator is `<op>[digits]`. Note the digits follow
+/// the operator (`HEAD~2`), which is why this cannot be parsed right to left.
+fn split_steps(spec: &str) -> (String, Vec<Step>, bool) {
+    let bytes = spec.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] != b'~' && bytes[i] != b'^' { i += 1; }
+    let base = spec[..i].to_string();
+
+    let rest = &spec[i..];
+    let rb = rest.as_bytes();
+    let mut steps: Vec<Step> = Vec::new();
+    let mut j = 0;
+    while j < rb.len() {
+        let op = rb[j];
+        if op != b'~' && op != b'^' { break; }
+        j += 1;
+        let num_start = j;
+        while j < rb.len() && rb[j].is_ascii_digit() { j += 1; }
+        let n = if num_start == j {
+            1
+        } else {
+            rest[num_start..j].parse::<usize>().unwrap_or(usize::MAX)
+        };
+        steps.push(match op {
+            b'~' if n == 0 => Step::First(0),
+            b'~' => Step::First(n),
+            _ if n == 0 => Step::First(0),
+            _ if n == 1 => Step::First(1),
+            _ if n == 2 => Step::Second,
+            _ => Step::TooDeep(n),
+        });
+    }
+    (base, steps, j == rb.len())
+}
+
+fn resolve_base(base: &str) -> Result<String, String> {
+    if base == "HEAD" || base == "@" {
+        return read_head().ok_or_else(|| "no commits yet (HEAD is unborn)".to_string());
+    }
+    if branch_exists(base) {
+        return read_branch(base).ok_or_else(|| format!("branch {base} has no commits yet"));
+    }
+    if commit_path(base).exists() { return Ok(base.to_string()); }
+    let mut matches: Vec<String> = list_commits().into_iter().filter(|h| h.starts_with(base)).collect();
+    matches.sort();
+    match matches.len() {
+        0 => Err(format!("commit {base} not found")),
+        1 => Ok(matches.remove(0)),
+        _ => Err(format!("ambiguous commit prefix {base}: {matches:?}")),
+    }
+}
+
+fn apply_step(hash: &str, step: Step, spec: &str) -> Result<String, String> {
+    match step {
+        Step::First(n) => {
+            let mut cur = hash.to_string();
+            for _ in 0..n {
+                let meta = super::commit::load_meta(&cur)
+                    .map_err(|e| format!("revision `{spec}`: {e}"))?;
+                cur = meta.parent.ok_or_else(|| {
+                    format!("revision `{spec}`: {cur} is a root commit, no parent to walk")
+                })?;
+            }
+            Ok(cur)
+        }
+        Step::Second => {
+            let meta = super::commit::load_meta(hash)
+                .map_err(|e| format!("revision `{spec}`: {e}"))?;
+            match meta.second_parent {
+                Some(p) => Ok(p),
+                None if meta.parent.is_some() => Err(format!(
+                    "revision `{spec}`: {hash} is not a merge commit, it has no second parent"
+                )),
+                None => Err(format!("revision `{spec}`: {hash} is a root commit, no parent to walk")),
+            }
+        }
+        Step::TooDeep(n) => Err(format!(
+            "revision `{spec}`: {hash} has at most 2 parents, cannot take ^{n}"
+        )),
+    }
+}
+
 pub fn deletions_file() -> PathBuf { stages_root().join(".gyat-deleted") }
 
 pub fn staged_deletions() -> Vec<String> {

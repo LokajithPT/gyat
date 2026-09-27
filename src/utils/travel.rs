@@ -145,12 +145,5 @@ fn collect(base: &Path, dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 }
 
 fn resolve_commit(prefix: &str) -> Result<String, String> {
-    if prefix.len() >= 16 {
-        if repo::commit_path(prefix).exists() { return Ok(prefix.to_string()); }
-    }
-    let commits = repo::list_commits();
-    let mut matches: Vec<String> = commits.into_iter().filter(|h| h.starts_with(prefix)).collect();
-    if matches.is_empty() { return Err(format!("commit {prefix} not found")); }
-    if matches.len() > 1 { return Err(format!("ambiguous commit prefix {prefix}: {:?}", matches)); }
-    Ok(matches.remove(0))
+    repo::resolve_rev(prefix)
 }

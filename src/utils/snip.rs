@@ -37,12 +37,20 @@ pub fn snip_bottom() -> Result<(), String> {
 
 pub fn snip_commit(start: &str, end: &str) -> Result<(), String> {
     repo::ensure_repo()?;
-    // range inclusive by hash prefix or full
-    let all = repo::list_commits();
-    let start_idx = all.iter().position(|h| h.starts_with(start)).ok_or(format!("start {start} not found"))?;
-    let end_idx = all.iter().position(|h| h.starts_with(end)).ok_or(format!("end {end} not found"))?;
+    // Range is inclusive, resolved by full/abbreviated hash, branch name, or
+    // any revision expression (`HEAD~2`, `main^2`, `abc123~1`, ...).
+    //
+    // Order by (timestamp, parent depth) — the same order `log` shows — not by
+    // hash, so that a range selects the commits a human would expect.
+    let hashes: Vec<String> = super::commit::list_metas().into_iter().map(|m| m.hash).collect();
+    let start_hash = repo::resolve_rev(start)?;
+    let end_hash = repo::resolve_rev(end)?;
+    let start_idx = hashes.iter().position(|h| *h == start_hash)
+        .ok_or(format!("start {start} not found in history"))?;
+    let end_idx = hashes.iter().position(|h| *h == end_hash)
+        .ok_or(format!("end {end} not found in history"))?;
     let (s, e) = if start_idx <= end_idx { (start_idx, end_idx) } else { (end_idx, start_idx) };
-    for h in all[s..=e].to_vec() {
+    for h in hashes[s..=e].to_vec() {
         println!("snip commit {h}");
         let dir = repo::commit_path(&h);
         let _ = fs::remove_dir_all(dir);

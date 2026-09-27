@@ -328,6 +328,110 @@ fn snip_top_drops_head() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn linear_repo(name: &str, n: usize) -> PathBuf {
+    let dir = fresh_dir(name);
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "rev", server.to_str().unwrap()).ok);
+    for i in 1..=n {
+        fs::write(dir.join("f.txt"), format!("v{i}\n")).unwrap();
+        assert!(run(&dir, &["add", "f.txt"], None).ok);
+        assert!(run(&dir, &["commit", &format!("c{i}")], None).ok);
+    }
+    dir
+}
+
+/// `~n` walks back n commits, `^` is the first parent, `@` is HEAD.
+#[test]
+fn revision_expressions_walk_history() {
+    let dir = linear_repo("revwalk", 5);
+    let seen = |rev: &str| -> String {
+        assert!(run(&dir, &["travel", "main"], None).ok);
+        let o = run(&dir, &["travel", rev], None);
+        assert!(o.ok, "travel {rev} failed: {}", o.text);
+        read(&dir.join("f.txt")).trim().to_string()
+    };
+    assert_eq!(seen("HEAD"), "v5");
+    assert_eq!(seen("HEAD~1"), "v4");
+    assert_eq!(seen("HEAD~2"), "v3");
+    assert_eq!(seen("HEAD~4"), "v1");
+    assert_eq!(seen("HEAD^"), "v4");
+    assert_eq!(seen("HEAD^1"), "v4");
+    assert_eq!(seen("@~3"), "v2");
+    assert_eq!(seen("main~2"), "v3");
+    assert_eq!(seen("main^"), "v4");
+    assert_eq!(seen("HEAD^0"), "v5", "^0 is the commit itself");
+    let h = branch_hash(&dir, "main");
+    assert_eq!(seen(&format!("{}~2", &h[..8])), "v3");
+
+    for bad in ["HEAD~5", "HEAD^3", "nosuch~1", "HEAD~x", "~1"] {
+        assert!(run(&dir, &["travel", "main"], None).ok);
+        let o = run(&dir, &["travel", bad], None);
+        assert!(!o.ok, "{bad} should have failed");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// On a merge commit `^` is the mainline parent and `^2` the merged-in one.
+#[test]
+fn revision_caret_two_is_the_merged_parent() {
+    let dir = fresh_dir("revmerge");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "mg", server.to_str().unwrap()).ok);
+
+    fs::write(dir.join("f.txt"), "base\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+    assert!(run(&dir, &["branch", "side"], None).ok);
+
+    fs::write(dir.join("m.txt"), "main\n").unwrap();
+    assert!(run(&dir, &["add", "m.txt"], None).ok);
+    assert!(run(&dir, &["commit", "main work"], None).ok);
+
+    assert!(run(&dir, &["travel", "side"], None).ok);
+    fs::write(dir.join("s.txt"), "side\n").unwrap();
+    assert!(run(&dir, &["add", "s.txt"], None).ok);
+    assert!(run(&dir, &["commit", "side work"], None).ok);
+
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    let o = run(&dir, &["merge", "side"], None);
+    assert!(o.ok, "merge failed: {}", o.text);
+
+    let has = |rev: &str, file: &str| -> bool {
+        assert!(run(&dir, &["travel", "main"], None).ok);
+        let o = run(&dir, &["travel", rev], None);
+        assert!(o.ok, "travel {rev} failed: {}", o.text);
+        dir.join(file).exists()
+    };
+    assert!(has("HEAD", "m.txt") && has("HEAD", "s.txt"), "merge should have both");
+    assert!(has("HEAD^", "m.txt") && !has("HEAD^", "s.txt"), "^ is the mainline parent");
+    assert!(has("HEAD^2", "s.txt") && !has("HEAD^2", "m.txt"), "^2 is the merged-in parent");
+    assert!(has("HEAD^2~1", "f.txt") && !has("HEAD^2~1", "s.txt"), "^2~1 walks off the side commit");
+
+    // ^2 on a non-merge is an error, not a silent fallback to the first parent
+    assert!(run(&dir, &["travel", "side"], None).ok);
+    let o = run(&dir, &["travel", "HEAD^2"], None);
+    assert!(!o.ok, "^2 on a non-merge commit should fail");
+    assert!(o.text.contains("not a merge commit"), "{}", o.text);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A snip range must select the commits a human sees in `log`, in log order.
+#[test]
+fn snip_range_uses_history_order_not_hash_order() {
+    let dir = linear_repo("sniprange", 5);
+    let o = run(&dir, &["snip", "range", "HEAD~3..HEAD~1"], None);
+    assert!(o.ok, "snip failed: {}", o.text);
+    let after = run(&dir, &["log", "--oneline"], None);
+    let subjects: Vec<&str> = after.text.lines().filter_map(|l| l.split(" c").nth(1)).collect();
+    assert_eq!(subjects, vec!["5", "1"], "expected c5 and c1 to survive, got: {}", after.text);
+    assert_eq!(read(&dir.join("f.txt")), "v5\n", "working tree should still be at c5");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn push_pull_clone_over_path_server() {
     let root = fresh_dir("remote");
