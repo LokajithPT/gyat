@@ -78,8 +78,23 @@ fn repair_refs(parents: &std::collections::HashMap<String, Option<String>>) -> R
     Ok(())
 }
 
+/// Refuse to rewrite history while a merge is unresolved. Snipping commits
+/// leaves MERGE_HEAD pointing at a hash that may no longer exist, and the
+/// next `commit` then writes a merge commit whose second parent is missing.
+fn ensure_no_merge_in_progress() -> Result<(), String> {
+    if let Some(h) = repo::read_merge_head() {
+        return Err(format!(
+            "cannot snip: a merge is in progress (MERGE_HEAD {})\n\
+             hint: resolve the conflict markers and `gyat commit \"msg\"` to finish it first",
+            &h[..8.min(h.len())]
+        ));
+    }
+    Ok(())
+}
+
 pub fn snip_top() -> Result<(), String> {
     repo::ensure_repo()?;
+    ensure_no_merge_in_progress()?;
     let head = repo::read_head().ok_or("no commits to snip")?;
     // Read the parent chain first: after the delete the metadata is gone.
     let parents = parent_map(std::slice::from_ref(&head));
@@ -93,6 +108,7 @@ pub fn snip_top() -> Result<(), String> {
 
 pub fn snip_bottom() -> Result<(), String> {
     repo::ensure_repo()?;
+    ensure_no_merge_in_progress()?;
     let mut metas = super::commit::list_metas();
     if metas.is_empty() { return Err("no commits to snip".to_string()); }
     metas.sort_by_key(|m| m.timestamp);
@@ -107,6 +123,7 @@ pub fn snip_bottom() -> Result<(), String> {
 
 pub fn snip_commit(start: &str, end: &str) -> Result<(), String> {
     repo::ensure_repo()?;
+    ensure_no_merge_in_progress()?;
     // Range is inclusive, resolved by full/abbreviated hash, branch name, or
     // any revision expression (`HEAD~2`, `main^2`, `abc123~1`, ...).
     //

@@ -25,6 +25,19 @@ pub fn init() -> Result<(), String> {
     if repo.is_empty() {
         return Err("repo name required".to_string());
     }
+    // The repo name becomes a directory on the server. A name containing `/`
+    // or shell metacharacters creates a nested path that `gyat list` cannot
+    // show and `gyat clone` cannot address, so refuse it up front.
+    if repo.contains('/') || repo.contains("..") || repo.contains(' ')
+        || repo.contains(';') || repo.contains('&') || repo.contains('|')
+        || repo.contains('$') || repo.contains('`') || repo.contains('<')
+        || repo.contains('>') || repo.contains('*') || repo.contains('?')
+        || repo.contains('\'') || repo.contains('"') || repo.contains('\\')
+    {
+        return Err(format!(
+            "invalid repo name '{repo}'\nhint: use letters, digits, `-` and `_` only"
+        ));
+    }
     let mut username = prompt("username");
     let static_cfg = super::host::load();
     let server_prompt = match &static_cfg {

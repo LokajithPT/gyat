@@ -1211,3 +1211,78 @@ fn doctor_exits_nonzero_when_a_check_fails() {
     assert!(text.contains("fail"), "expected a failing check, got:\n{text}");
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Snipping during an unresolved merge left MERGE_HEAD pointing at a hash
+/// that might be gone, and the next commit wrote a merge commit whose second
+/// parent did not exist.
+#[test]
+fn snip_refuses_while_a_merge_is_unresolved() {
+    let dir = fresh_dir("snipmerge");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo12", server.to_str().unwrap()).ok);
+    fs::write(dir.join("f.txt"), "base\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+
+    assert!(run(&dir, &["branch", "a1"], None).ok);
+    assert!(run(&dir, &["travel", "a1"], None).ok);
+    fs::write(dir.join("f.txt"), "A\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "a1c"], None).ok);
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    fs::write(dir.join("f.txt"), "M\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "m1"], None).ok);
+
+    let o = run(&dir, &["merge", "a1"], None);
+    assert!(!o.ok, "expected a conflict: {}", o.text);
+    let merge_head = read(&dir.join(".gyt/MERGE_HEAD")).trim().to_string();
+    assert!(!merge_head.is_empty(), "MERGE_HEAD should be set after a conflict");
+
+    for args in [
+        vec!["snip", "top"],
+        vec!["snip", "bottom"],
+        vec!["snip", "range", "HEAD~1..HEAD"],
+    ] {
+        let o = run(&dir, &args, None);
+        assert!(!o.ok, "{args:?} should be refused mid-merge: {}", o.text);
+        assert!(o.text.contains("merge is in progress"), "{}", o.text);
+    }
+    assert_eq!(
+        read(&dir.join(".gyt/MERGE_HEAD")).trim(),
+        merge_head,
+        "MERGE_HEAD was disturbed by a refused snip"
+    );
+
+    // finishing the merge clears the block
+    fs::write(dir.join("f.txt"), "resolved\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "resolve"], None).ok);
+    assert!(read(&dir.join(".gyt/MERGE_HEAD")).trim().is_empty());
+    let o = run(&dir, &["snip", "top"], None);
+    assert!(o.ok, "snip should work once the merge is finished: {}", o.text);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The repo name becomes a server directory. Names with `/` or shell
+/// metacharacters produced nested paths that `list` and `clone` could not
+/// address, so they are rejected at init.
+#[test]
+fn init_rejects_repo_names_that_cannot_be_addressed() {
+    for bad in ["bad;name", "has space", "a/b", "..", "q'uote", "star*", "d$x"] {
+        let dir = fresh_dir(&format!("name{}", bad.len()));
+        let out = run(&dir, &["init"], Some(&format!("{bad}\nloki\n\n\n")));
+        assert!(!out.ok, "repo name {bad:?} should be rejected");
+        assert!(out.text.contains("invalid repo name"), "{}", out.text);
+        assert!(!dir.join(".gyt").exists(), "{bad:?} should not create a repo");
+        let _ = fs::remove_dir_all(&dir);
+    }
+    // a normal name still works
+    let dir = fresh_dir("nameok");
+    let out = run(&dir, &["init"], Some("my-repo_2\nloki\n\n\n"));
+    assert!(out.ok, "valid name rejected: {}", out.text);
+    assert!(dir.join(".gyt").exists());
+    let _ = fs::remove_dir_all(&dir);
+}
