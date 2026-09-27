@@ -357,11 +357,55 @@ fn push_pull_clone_over_path_server() {
     assert!(run(&clone, &["commit", "clone work"], None).ok);
     assert!(run(&clone, &["push"], None).ok);
 
-    // pull in repo1, checkout, file appears
+    // pull in repo1: the working tree must be brought up to date by the pull
+    // itself, without an explicit `travel`.
     let o = run(&repo1, &["pull"], None);
     assert!(o.ok, "pull failed: {}", o.text);
-    assert!(run(&repo1, &["travel", "main"], None).ok);
-    assert_eq!(read(&repo1.join("b.txt")), "b\n");
+    assert_eq!(read(&repo1.join("b.txt")), "b\n", "pull did not update the working tree");
+    assert_eq!(branch_hash(&repo1, "main"), branch_hash(&clone, "main"), "pull did not advance main");
+    let o = run(&repo1, &["status"], None);
+    assert!(!o.text.contains("Changes not staged"), "worktree diverged after pull:\n{}", o.text);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A pull must never destroy uncommitted work, but must still bring every
+/// untouched file up to date.
+#[test]
+fn pull_preserves_local_edits_and_syncs_the_rest() {
+    let root = fresh_dir("pullsafe");
+    let server = root.join("server");
+    fs::create_dir_all(&server).unwrap();
+
+    let repo1 = root.join("repo1");
+    fs::create_dir_all(&repo1).unwrap();
+    assert!(init_repo(&repo1, "safe", server.to_str().unwrap()).ok);
+    fs::write(repo1.join("shared.txt"), "base\n").unwrap();
+    assert!(run(&repo1, &["add", "shared.txt"], None).ok);
+    assert!(run(&repo1, &["commit", "init"], None).ok);
+    assert!(run(&repo1, &["push"], None).ok);
+
+    let clone = root.join("clone");
+    assert!(run(&root, &["clone", server.join("safe").to_str().unwrap(), "clone"], None).ok);
+    fs::write(clone.join("shared.txt"), "from clone\n").unwrap();
+    fs::write(clone.join("added.txt"), "new file\n").unwrap();
+    assert!(run(&clone, &["add", "."], None).ok);
+    assert!(run(&clone, &["commit", "clone work"], None).ok);
+    assert!(run(&clone, &["push"], None).ok);
+
+    // dirty shared.txt locally: the pull must warn, not clobber it
+    fs::write(repo1.join("shared.txt"), "my uncommitted edit\n").unwrap();
+    let o = run(&repo1, &["pull"], None);
+    assert!(o.ok, "pull failed: {}", o.text);
+    assert_eq!(
+        read(&repo1.join("shared.txt")),
+        "my uncommitted edit\n",
+        "pull overwrote an uncommitted edit"
+    );
+    assert!(o.text.contains("local changes"), "expected a warning about local changes, got:\n{}", o.text);
+
+    // an unrelated new file from upstream still lands
+    assert_eq!(read(&repo1.join("added.txt")), "new file\n", "pull did not sync untouched file");
 
     let _ = fs::remove_dir_all(&root);
 }

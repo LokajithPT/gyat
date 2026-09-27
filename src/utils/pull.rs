@@ -33,6 +33,7 @@ fn ingest(server_commits: &Path, server_refs: &Path, label: &str) -> Result<(), 
         println!("no remote repo at {label} - nothing to pull, push first");
         return Ok(());
     }
+    let old_head = super::repo::read_head();
     let mut fetched = 0;
     if server_commits.exists() {
         for entry in fs::read_dir(server_commits).map_err(|e| format!("read server commits: {e}"))? {
@@ -63,9 +64,103 @@ fn ingest(server_commits: &Path, server_refs: &Path, label: &str) -> Result<(), 
             }
         }
     }
+    let refreshed = refresh_worktree(old_head.as_deref());
     println!("pull from {label} done: {fetched} commits, {fetched_branches} branches");
+    if refreshed > 0 {
+        println!("updated working tree: {refreshed} file(s) from remote");
+    }
     println!("hint: `gyat branch` to see, `gyat travel <branch>` to checkout");
     Ok(())
+}
+
+/// Bring the working tree and `.gyt/current` in line with the current branch
+/// after a pull moved its ref. Files the incoming commits changed are restored;
+/// files that also carry uncommitted local edits are reported and left alone so
+/// a pull never silently destroys work.
+fn refresh_worktree(old_head: Option<&str>) -> usize {
+    let Some(old) = old_head else { return 0 };
+    if old.is_empty() || super::repo::is_detached() { return 0; }
+    let Some(new_head) = super::repo::read_head() else { return 0; };
+    if new_head == old { return 0; }
+    let old_snap = super::repo::commit_snapshot_root(old);
+    let new_snap = super::repo::commit_snapshot_root(&new_head);
+    if !new_snap.exists() { return 0; }
+
+    let old_files = snapshot_bytes(&old_snap);
+    let new_files = snapshot_bytes(&new_snap);
+    let mut changed = 0usize;
+
+    for (rel, new_bytes) in &new_files {
+        let ws = Path::new(".").join(rel);
+        let cur = fs::read(&ws).ok();
+        if cur.as_deref() == Some(new_bytes.as_slice()) { continue; } // already current
+        if let Some(cur) = &cur {
+            // Clean only if the worktree still matches the commit we came from.
+            // Anything else is an uncommitted edit the pull must not destroy.
+            let matches_old = old_files.get(rel).map(|o| *o == *cur).unwrap_or(false);
+            if !matches_old {
+                eprintln!(
+                    "warning: {} has local changes, not overwritten (commit them, or `gyat travel <branch>` to reset)",
+                    rel.display()
+                );
+                continue;
+            }
+        }
+        if let Some(p) = ws.parent() { let _ = fs::create_dir_all(p); }
+        if fs::write(&ws, new_bytes).is_ok() {
+            changed += 1;
+        } else {
+            eprintln!("warning: could not update {}", rel.display());
+        }
+    }
+
+    for (rel, old_bytes) in &old_files {
+        if new_files.contains_key(rel) { continue; }
+        let ws = Path::new(".").join(rel);
+        match fs::read(&ws) {
+            Ok(cur) if cur == *old_bytes => {
+                if fs::remove_file(&ws).is_ok() { changed += 1; }
+            }
+            Ok(_) => eprintln!("warning: {} deleted upstream but locally modified, kept", rel.display()),
+            Err(_) => {}
+        }
+    }
+
+    rebuild_current(&new_snap);
+    changed
+}
+
+/// Every file in a commit snapshot, keyed by its uncompressed relative path,
+/// with the stored bytes (transparently gunzipping `.gz` entries).
+fn snapshot_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    if !root.exists() { return out; }
+    for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() { continue; }
+        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+        let stored = entry.path().to_path_buf();
+        let key = match rel.to_str() {
+            Some(s) if s.ends_with(".gz") => PathBuf::from(s.trim_end_matches(".gz")),
+            Some(s) => PathBuf::from(s),
+            None => continue,
+        };
+        if let Ok(bytes) = super::compression::read_bytes_maybe_compressed(&stored) {
+            out.insert(key, bytes);
+        }
+    }
+    out
+}
+
+/// Re-mirror `.gyt/current` from a commit snapshot.
+fn rebuild_current(snap: &Path) {
+    let current = super::repo::current_root();
+    let _ = fs::remove_dir_all(&current);
+    if fs::create_dir_all(&current).is_err() { return; }
+    for (rel, bytes) in snapshot_bytes(snap) {
+        let dst = current.join(rel);
+        if let Some(p) = dst.parent() { let _ = fs::create_dir_all(p); }
+        let _ = fs::write(dst, bytes);
+    }
 }
 
 fn pull_ssh(cfg: &super::config::Config, commit: Option<String>) -> Result<(), String> {
