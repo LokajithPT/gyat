@@ -1286,3 +1286,102 @@ fn init_rejects_repo_names_that_cannot_be_addressed() {
     assert!(dir.join(".gyt").exists());
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---- storage / transfer regressions ----------------------------------------
+
+fn snapshot_text(dir: &Path, branch: &str, file: &str) -> String {
+    let h = branch_hash(dir, branch);
+    let p = dir.join(format!(".gyt/commits/{h}/snapshot/{file}.gz"));
+    if p.exists() {
+        return String::from_utf8_lossy(&gunzip(&p)).to_string();
+    }
+    read(&dir.join(format!(".gyt/commits/{h}/snapshot/{file}")))
+}
+
+fn gunzip(p: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let f = std::fs::File::open(p).unwrap();
+    let mut d = flate2::read::GzDecoder::new(f);
+    let mut out = Vec::new();
+    d.read_to_end(&mut out).unwrap();
+    out
+}
+
+/// Snapshots are hardlinked forward from the parent commit to avoid storing the
+/// whole tree per commit. Writing a changed file must not truncate the shared
+/// inode, or every older commit silently changes to the newest content.
+#[test]
+fn editing_a_file_never_rewrites_older_snapshots() {
+    let dir = fresh_dir("snapshotimmutable");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "repo13", server.to_str().unwrap()).ok);
+
+    let mut tips = vec![];
+    for i in 1..=6 {
+        fs::write(dir.join("f.txt"), format!("v{i}\n")).unwrap();
+        assert!(run(&dir, &["add", "f.txt"], None).ok);
+        assert!(run(&dir, &["commit", &format!("c{i}")], None).ok);
+        tips.push(branch_hash(&dir, "main"));
+    }
+
+    // every commit must still hold its own content
+    for (i, tip) in tips.iter().enumerate() {
+        let p = dir.join(format!(".gyt/commits/{tip}/snapshot/f.txt.gz"));
+        let got = if p.exists() {
+            String::from_utf8_lossy(&gunzip(&p)).to_string()
+        } else {
+            read(&dir.join(format!(".gyt/commits/{tip}/snapshot/f.txt")))
+        };
+        assert_eq!(got, format!("v{}\n", i + 1), "commit {} was rewritten to {got:?}", i + 1);
+    }
+
+    // and checking them out gives the right content
+    for (i, _tip) in tips.iter().enumerate() {
+        assert!(run(&dir, &["travel", "main"], None).ok);
+        let o = run(&dir, &["travel", &format!("main~{}", tips.len() - 1 - i)], None);
+        assert!(o.ok, "travel failed: {}", o.text);
+        assert_eq!(read(&dir.join("f.txt")), format!("v{}\n", i + 1));
+    }
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A push must send only the commits the server is missing, and the server
+/// must end up with a complete, correct history either way.
+#[test]
+fn incremental_push_transfers_only_new_commits() {
+    let root = fresh_dir("incpush");
+    let shim = write_ssh_shim(&root);
+    let srv = root.join("srv");
+    fs::create_dir_all(&srv).unwrap();
+    let remote = format!("fakehost:{}/ip", srv.display());
+
+    let a = root.join("a");
+    fs::create_dir_all(&a).unwrap();
+    assert!(init_repo(&a, "ip", &remote).ok);
+    for i in 1..=3 {
+        fs::write(a.join("f.txt"), format!("v{i}\n")).unwrap();
+        assert!(run_ssh(&a, &shim, &srv, &["add", "f.txt"], None).ok);
+        assert!(run_ssh(&a, &shim, &srv, &["commit", &format!("c{i}")], None).ok);
+        let o = run_ssh(&a, &shim, &srv, &["push"], None);
+        assert!(o.ok, "push {i} failed: {}", o.text);
+    }
+
+    let server_hashes: Vec<String> = fs::read_dir(srv.join("ip/commits"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(server_hashes.len(), 3, "server should hold all 3 commits");
+    let server_main = read(&srv.join("ip/refs/heads/main")).trim().to_string();
+    assert_eq!(server_main, branch_hash(&a, "main"));
+
+    // cloning from the server gives the full, correct history
+    let b = root.join("b");
+    assert!(run_ssh(&root, &shim, &srv, &["clone", &remote, "b"], None).ok);
+    assert_eq!(read(&b.join("f.txt")), "v3\n");
+    assert!(run_ssh(&b, &shim, &srv, &["log", "--oneline"], None).text.contains("c1"));
+
+    let _ = fs::remove_dir_all(&root);
+}

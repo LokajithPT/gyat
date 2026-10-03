@@ -8,10 +8,17 @@ use flate2::Compression;
 pub fn compress_file(src: &Path, dst: &Path, level: u32) -> Result<(), String> {
     let data = fs::read(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     if let Some(p) = dst.parent() { fs::create_dir_all(p).map_err(|e| format!("mkdir {p:?}: {e}"))?; }
-    let file = fs::File::create(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-    let mut enc = GzEncoder::new(file, Compression::new(level));
-    enc.write_all(&data).map_err(|e| format!("compress: {e}"))?;
-    enc.finish().map_err(|e| format!("finish: {e}"))?;
+    // Write to a temp file and rename. Snapshot entries are hardlinked from the
+    // parent commit, so `File::create(dst)` would truncate the *shared* inode
+    // and silently rewrite the parent's history.
+    let tmp = dst.with_extension("gz.tmp");
+    {
+        let file = fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let mut enc = GzEncoder::new(file, Compression::new(level));
+        enc.write_all(&data).map_err(|e| format!("compress: {e}"))?;
+        enc.finish().map_err(|e| format!("finish: {e}"))?;
+    }
+    fs::rename(&tmp, dst).map_err(|e| format!("rename into {}: {e}", dst.display()))?;
     Ok(())
 }
 

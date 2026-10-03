@@ -101,8 +101,17 @@ fn collect_set(base: &Path, dir: &Path, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Seed a new commit's snapshot from its parent's.
+///
+/// Files are carried over with hardlinks instead of copies: a snapshot entry
+/// is written once and never modified in place, so sharing the inode is safe.
+/// Copying every file forward on every commit made a 42-commit repo cost
+/// 339 MB on disk and turned each commit into a full-tree byte copy; with
+/// links only the files that actually changed take new space.
 fn copy_dir_compressed(src: &Path, dst: &Path, _settings: &super::settings::GyatSettings) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("mkdir {dst:?}: {e}"))?;
+    let mut linked = 0usize;
+    let mut copied = 0usize;
     for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
         if p.is_file() {
@@ -111,8 +120,19 @@ fn copy_dir_compressed(src: &Path, dst: &Path, _settings: &super::settings::Gyat
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
             }
-            fs::copy(p, &target).map_err(|e| format!("copy {rel:?}: {e}"))?;
+            if fs::hard_link(p, &target).is_ok() {
+                linked += 1;
+            } else {
+                fs::copy(p, &target).map_err(|e| format!("copy {rel:?}: {e}"))?;
+                copied += 1;
+            }
         }
+    }
+    if linked > 0 || copied > 0 {
+        super::remote::progress(&format!(
+            "reused {linked} unchanged file(s) from parent{}",
+            if copied > 0 { format!(", copied {copied}") } else { String::new() }
+        ));
     }
     Ok(())
 }
@@ -131,6 +151,12 @@ pub fn commit_with_message(message: String) -> Result<(), String> {
         return Err(format!("On branch {branch}\nnothing to commit, working tree clean\n(hint: `gyat add <files>` to stage)"));
     }
     let branch = repo::current_branch().unwrap_or_else(|| "(detached)".to_string());
+    let t_start = std::time::Instant::now();
+    super::remote::progress(&format!(
+        "committing {} staged file(s){}",
+        staged.len(),
+        if staged_deletions.is_empty() { String::new() } else { format!(", {} deletion(s)", staged_deletions.len()) }
+    ));
     let parent = repo::read_head();
     let merge_parent = repo::read_merge_head().or(None);
     let is_merge = merge_parent.is_some();
@@ -206,6 +232,7 @@ pub fn commit_with_message(message: String) -> Result<(), String> {
             }
         }
     }
+    super::remote::progress(&format!("committed in {:.2}s", t_start.elapsed().as_secs_f64()));
     // contextual hints
     if repo::read_merge_head().is_some() {
         // still in merge (should have been cleared, but just in case)
@@ -267,6 +294,8 @@ pub fn create_commit_with_parents(message: String, second_parent: Option<String>
     content_combined.push_str(&settings.chunks.size.to_string());
     let hash = hash_commit(&parent, &second_parent, &message, &author, ts, &files, &content_combined);
 
+    super::remote::progress(&format!("writing snapshot for {} file(s)", files.len()));
+    let t_snap = std::time::Instant::now();
     let commit_dir = repo::commit_path(&hash);
     if commit_dir.exists() { return Err(format!("commit {hash} already exists")); }
     let snap_root = repo::commit_snapshot_root(&hash);
@@ -357,6 +386,7 @@ pub fn create_commit_with_parents(message: String, second_parent: Option<String>
     fs::create_dir_all(repo::stages_root()).map_err(|e| format!("recreate stages: {e}"))?;
     // deletions file lives inside stages and is gone with it; be explicit for clarity
     let _ = fs::remove_file(repo::deletions_file());
+    super::remote::progress(&format!("snapshot written in {:.2}s", t_snap.elapsed().as_secs_f64()));
     Ok(hash)
 }
 
