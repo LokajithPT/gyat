@@ -43,9 +43,21 @@ pub fn push_remote(force: bool) -> Result<(), String> {
             let key = super::host::effective_key(cfg.ssh.as_ref().map(|s| s.key_path.as_str()));
             let key = super::remote::expand_tilde(&key);
             let target = super::remote::SshTarget { user, host, port, key_path: Some(key) };
+            super::remote::progress("contacting server");
+            let have = super::remote::server_commit_set(&target, &path);
+            let local_all = super::repo::list_commits();
+            let already = local_all.iter().filter(|h| have.contains(*h)).count();
+            if already > 0 {
+                super::remote::progress(&format!(
+                    "server already has {already} of {} commit(s)",
+                    local_all.len()
+                ));
+            }
+            let wanted: std::collections::HashSet<String> =
+                local_all.iter().filter(|h| !have.contains(*h)).cloned().collect();
             return match branch {
-                Some(b) => push_ssh(&b, &head_hash, target, &path, force),
-                None => push_all_ssh(target, &path, force),
+                Some(b) => push_ssh(&b, &head_hash, target, &path, force, Some(&wanted)),
+                None => push_all_ssh(target, &path, force, Some(&wanted)),
             };
         }
         super::remote::Remote::Path(_) => {}
@@ -111,6 +123,7 @@ fn push_all_ssh(
     target: super::remote::SshTarget,
     path: &str,
     force: bool,
+    wanted: Option<&std::collections::HashSet<String>>,
 ) -> Result<(), String> {
     let branches = super::repo::list_branches();
     if branches.is_empty() {
@@ -119,18 +132,20 @@ fn push_all_ssh(
     println!("HEAD is detached - pushing all {} local branch(es)", branches.len());
     for b in branches {
         if let Some(hash) = super::repo::read_branch(&b) {
-            push_ssh(&b, &hash, target.clone(), path, force)?;
+            push_ssh(&b, &hash, target.clone(), path, force, wanted)?;
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_ssh(
     branch: &str,
     head_hash: &str,
     target: super::remote::SshTarget,
     path: &str,
     force: bool,
+    wanted: Option<&std::collections::HashSet<String>>,
 ) -> Result<(), String> {
     let dest = target.label();
     println!(
@@ -138,9 +153,18 @@ fn push_ssh(
         &head_hash[..8.min(head_hash.len())]
     );
 
-    let bundle = super::remote::pack_local_repo()?;
+    let t0 = std::time::Instant::now();
+    let bundle = super::remote::pack_for_push(wanted)?;
+    super::remote::progress(&format!(
+        "bundle {} ready in {:.2}s",
+        super::remote::human_bytes(bundle.len() as u64),
+        t0.elapsed().as_secs_f64()
+    ));
     let extra: &[&str] = if force { &["--force"] } else { &[] };
+    super::remote::progress(&format!("uploading {} over ssh", super::remote::human_bytes(bundle.len() as u64)));
+    let t1 = std::time::Instant::now();
     let out = target.run_server("receive", path, extra, Some(&bundle))?;
+    super::remote::progress(&format!("server responded in {:.2}s", t1.elapsed().as_secs_f64()));
     let text = String::from_utf8_lossy(&out);
     for line in text.lines() {
         println!("remote: {line}");

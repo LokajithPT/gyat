@@ -42,6 +42,12 @@ enum Commands {
         /// server-side repo path
         repo: String,
     },
+    /// Print every commit hash the server already has for <repo>, one per
+    /// line. `gyat push` uses this to send only what is missing.
+    Have {
+        /// server-side repo path
+        repo: String,
+    },
     /// List repos under a data dir, or branches of a repo.
     List {
         /// data dir or repo path (defaults to server data dir)
@@ -170,6 +176,28 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<usize, String> {
         }
     }
     Ok(n)
+}
+
+/// Print the commit hashes the server already stores for `repo`.
+///
+/// A missing repo is not an error: it simply has nothing, so the client sends
+/// its whole history. Exits 0 with empty output in that case.
+fn do_have(repo: &str) -> Result<(), String> {
+    let commits = Path::new(repo).join("commits");
+    if !commits.is_dir() {
+        return Ok(());
+    }
+    let mut names: Vec<String> = fs::read_dir(&commits)
+        .map_err(|e| format!("read commits: {e}"))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    for n in names {
+        println!("{n}");
+    }
+    Ok(())
 }
 
 fn do_receive(repo: &str, bundle: Option<&str>, force: bool) -> Result<(), String> {
@@ -394,6 +422,7 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Commands::Receive { repo, bundle, force } => do_receive(&repo, bundle.as_deref(), force),
+        Commands::Have { repo } => do_have(&repo),
         Commands::Fetch { repo } => do_fetch(&repo),
         Commands::List { path } => do_list(path.as_deref(), &cfg.dir.path),
     }

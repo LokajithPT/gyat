@@ -253,23 +253,6 @@ fn server_missing(err: &str) -> bool {
         && e.contains("gyat-server")
 }
 
-/// Pack local `.gyt/commits` + `.gyt/refs` into a push bundle (in memory).
-pub fn pack_local_repo() -> Result<Vec<u8>, String> {
-    super::repo::ensure_repo()?;
-    let stage = super::repo::gyt_root().join(".bundle-stage");
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage).map_err(|e| format!("bundle stage: {e}"))?;
-    let r = (|| -> Result<Vec<u8>, String> {
-        copy_newer_tree(&super::repo::commits_root(), &stage.join("commits"))?;
-        copy_newer_tree(&super::repo::gyt_root().join("refs"), &stage.join("refs"))?;
-        let mut buf = Vec::new();
-        gyat_bundle::pack_dir(&stage, &mut buf)?;
-        Ok(buf)
-    })();
-    let _ = std::fs::remove_dir_all(&stage);
-    r
-}
-
 fn copy_newer_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     if !src.exists() {
         return Ok(());
@@ -395,4 +378,96 @@ mod tests {
             _ => panic!("expected ssh"),
         }
     }
+}
+
+/// Progress line for long operations. Goes to stderr so stdout stays usable
+/// for piping, and is silent when stderr is not a terminal (tests, scripts).
+pub fn progress(msg: &str) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        eprintln!("  {msg}");
+    }
+}
+
+/// Human-readable byte size.
+pub fn human_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    let n = n as f64;
+    if n < KB { return format!("{n:.0} B"); }
+    if n < KB * KB { return format!("{:.1} KB", n / KB); }
+    if n < KB * KB * KB { return format!("{:.1} MB", n / (KB * KB)); }
+    if n < KB * KB * KB * KB { return format!("{:.2} GB", n / (KB * KB * KB)); }
+    format!("{:.2} TB", n / (KB * KB * KB * KB))
+}
+
+/// Ask the server which commits it already has, so a push can send only the
+/// missing ones instead of the entire history on every run.
+pub fn server_commit_set(target: &SshTarget, path: &str) -> std::collections::HashSet<String> {
+    match target.run_server("have", path, &[], None) {
+        Ok(out) => String::from_utf8_lossy(&out)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        // an older server without `have`, or no repo yet: send everything
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// Pack the local repo for a push, sending only `wanted` commits.
+///
+/// Every commit carries a full snapshot, so re-packing the whole history made
+/// push cost grow with the repo. Restricting it to the commits the server is
+/// missing keeps a push proportional to what actually changed.
+pub fn pack_for_push(wanted: Option<&std::collections::HashSet<String>>) -> Result<Vec<u8>, String> {
+    super::repo::ensure_repo()?;
+    let stage = super::repo::gyt_root().join(".bundle-stage");
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).map_err(|e| format!("bundle stage: {e}"))?;
+    let r = (|| -> Result<Vec<u8>, String> {
+        let commits = super::repo::commits_root();
+        let all = super::repo::list_commits();
+        let selected: Vec<String> = match wanted {
+            Some(set) => all.iter().filter(|h| set.contains(*h)).cloned().collect(),
+            None => all.clone(),
+        };
+        progress(&format!(
+            "packing {} of {} commit(s)",
+            selected.len(),
+            all.len()
+        ));
+        for (i, hash) in selected.iter().enumerate() {
+            let src = commits.join(hash);
+            if src.exists() {
+                copy_tree(&src, &stage.join("commits").join(hash))?;
+            }
+            if i % 25 == 0 || i + 1 == selected.len() {
+                progress(&format!("  staged {}/{} commit(s)", i + 1, selected.len()));
+            }
+        }
+        copy_newer_tree(&super::repo::gyt_root().join("refs"), &stage.join("refs"))?;
+        progress("compressing bundle");
+        let mut buf = Vec::new();
+        gyat_bundle::pack_dir(&stage, &mut buf)?;
+        Ok(buf)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    r
+}
+
+/// Recursively copy a directory tree.
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    for entry in walkdir::WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.is_file() {
+            let rel = p.strip_prefix(src).unwrap();
+            let target = dst.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            }
+            std::fs::copy(p, &target).map_err(|e| format!("copy {}: {e}", rel.display()))?;
+        }
+    }
+    Ok(())
 }
