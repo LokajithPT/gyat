@@ -172,7 +172,10 @@ fn main() {
     };
 
     if let Err(e) = res {
-        eprintln!("error: {e}");
+        // Errors from library code must not carry their own "error: " prefix,
+        // or the user sees "error: error: ...".
+        let msg = e.strip_prefix("error: ").unwrap_or(&e);
+        eprintln!("error: {msg}");
         std::process::exit(1);
     }
 }

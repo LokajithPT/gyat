@@ -116,7 +116,7 @@ pub fn init() -> Result<(), String> {
     super::gyatignore::ensure_default()?;
     println!("initialized gyat repo `{}` on branch main", cfg.repo.name);
     println!("  config: .gyt/config.toml");
-    println!("  settings: gyat.toml (compression, chunks)");
+    println!("  settings: gyat.toml (compression)");
     println!("  ignore: .gyatignore");
     println!("  stages: .gyt/stages/");
     println!("  commits: .gyt/commits/");

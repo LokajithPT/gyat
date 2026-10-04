@@ -18,3 +18,4 @@ glob = "0.3"
 flate2 = "1"
 gyat-bundle = { path = "bundle" }
 owo-colors = "4.4.0"
+libc = "0.2"

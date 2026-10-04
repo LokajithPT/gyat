@@ -31,16 +31,47 @@ pub fn read_head() -> Option<String> {
     Some(s)
 }
 
+
+// ---- durable writes -------------------------------------------------------
+// A plain fs::write can leave a truncated file behind if the machine loses
+// power the moment after the write returns, which is how a ref or a snapshot
+// ends up half-written. These helpers force the bytes to disk before the
+// caller is told the write succeeded.
+
+/// fsync a directory so a rename into it is durable.
+pub fn fsync_dir(dir: &Path) {
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// Write `data` to `path` so that a crash leaves either the old contents or
+/// the complete new ones, never a partial file.
+pub fn write_durable(path: &Path, data: &[u8]) -> Result<(), String> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    let file_name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = parent.join(format!(".{file_name}.tmp"));
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(data).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        f.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| format!("rename into {}: {e}", path.display()))?;
+    fsync_dir(parent);
+    Ok(())
+}
+
 pub fn write_head(hash: &str) -> Result<(), String> {
     let head_content = fs::read_to_string(head_path()).unwrap_or_default();
     if head_content.starts_with("ref: ") {
         let ref_path = head_content.trim_start_matches("ref: ").trim().to_string();
         let branch_file = gyt_root().join(&ref_path);
         if let Some(p) = branch_file.parent() { fs::create_dir_all(p).map_err(|e| format!("mkdir refs: {e}"))?; }
-        fs::write(branch_file, hash).map_err(|e| format!("write branch {ref_path}: {e}"))?;
-        Ok(())
+        write_durable(&branch_file, hash.as_bytes())
     } else {
-        fs::write(head_path(), hash).map_err(|e| format!("write HEAD: {e}"))
+        write_durable(&head_path(), hash.as_bytes())
     }
 }
 
@@ -57,7 +88,7 @@ pub fn current_branch() -> Option<String> {
 
 pub fn set_head_branch(branch: &str) -> Result<(), String> {
     let ref_str = format!("ref: refs/heads/{branch}");
-    fs::write(head_path(), ref_str).map_err(|e| format!("write HEAD: {e}"))
+    write_durable(&head_path(), ref_str.as_bytes())
 }
 
 #[allow(dead_code)]
@@ -91,7 +122,7 @@ pub fn read_branch(name: &str) -> Option<String> {
 pub fn write_branch(name: &str, hash: &str) -> Result<(), String> {
     let p = branch_path(name);
     if let Some(parent) = p.parent() { fs::create_dir_all(parent).map_err(|e| format!("mkdir refs: {e}"))?; }
-    fs::write(p, hash).map_err(|e| format!("write branch {name}: {e}"))
+    write_durable(&p, hash.as_bytes())
 }
 
 pub fn merge_head_path() -> PathBuf { gyt_root().join("MERGE_HEAD") }
@@ -99,7 +130,7 @@ pub fn read_merge_head() -> Option<String> {
     fs::read_to_string(merge_head_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 pub fn write_merge_head(hash: &str) -> Result<(), String> {
-    fs::write(merge_head_path(), hash).map_err(|e| format!("write MERGE_HEAD: {e}"))
+    write_durable(&merge_head_path(), hash.as_bytes())
 }
 pub fn clear_merge_head() -> Result<(), String> {
     let p = merge_head_path();

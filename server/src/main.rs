@@ -182,6 +182,22 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<usize, String> {
 ///
 /// A missing repo is not an error: it simply has nothing, so the client sends
 /// its whole history. Exits 0 with empty output in that case.
+/// Write a ref and force it to disk, so a crash cannot leave a torn hash.
+fn write_ref_durable(path: &Path, hash: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    f.write_all(hash.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all().map_err(|e| format!("fsync {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Monotonic counter so concurrent receives never share a staging path.
+fn next_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::SeqCst)
+}
+
 fn do_have(repo: &str) -> Result<(), String> {
     let commits = Path::new(repo).join("commits");
     if !commits.is_dir() {
@@ -200,9 +216,60 @@ fn do_have(repo: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Hold an exclusive advisory lock for the duration of a receive.
+///
+/// Two pushes to the same repo used to race: both unpacked into the same
+/// `incoming` directory and interleaved ref updates. flock is released by the
+/// kernel if we die, so a crashed push cannot wedge the repo permanently.
+struct RepoLock {
+    file: std::fs::File,
+}
+
+impl RepoLock {
+    fn acquire(repo_path: &Path) -> Result<Self, String> {
+        let dir = repo_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir).map_err(|e| format!("lock dir {}: {e}", dir.display()))?;
+        let lock_path = dir.join(format!(
+            ".{}.lock",
+            repo_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "repo".into())
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
+        // Block for up to ~30s rather than failing instantly, then give up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 { break; }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "another push is in progress for {} (waited 30s)",
+                    repo_path.display()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(RepoLock { file })
+    }
+}
+
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
+        }
+    }
+}
+
 fn do_receive(repo: &str, bundle: Option<&str>, force: bool) -> Result<(), String> {
     let repo_path = Path::new(repo);
-    let incoming = tmp_dir("incoming")?;
+    // Serialise concurrent pushes to this repo before touching anything.
+    let _lock = RepoLock::acquire(repo_path)?;
+    let incoming = tmp_dir(&format!("incoming-{}-{}", std::process::id(), next_seq()))?;
 
     // read bundle from file or stdin
     if let Some(f) = bundle {
@@ -286,12 +353,12 @@ fn do_receive(repo: &str, bundle: Option<&str>, force: bool) -> Result<(), Strin
             let dst = repo_path.join("refs/heads").join(&name);
             let old_hash = fs::read_to_string(&dst).unwrap_or_default().trim().to_string();
             if old_hash.is_empty() {
-                fs::write(&dst, &new_hash).map_err(|e| format!("write ref {name}: {e}"))?;
+                write_ref_durable(&dst, &new_hash).map_err(|e| format!("write ref {name}: {e}"))?;
                 created_refs.push(format!("{name} -> {}", &new_hash[..8.min(new_hash.len())]));
             } else if old_hash == new_hash {
                 // already up to date, nothing to do
             } else if force || is_ancestor(repo_path, &old_hash, &new_hash) {
-                fs::write(&dst, &new_hash).map_err(|e| format!("write ref {name}: {e}"))?;
+                write_ref_durable(&dst, &new_hash).map_err(|e| format!("write ref {name}: {e}"))?;
                 updated.push(format!(
                     "{name} {} -> {}",
                     &old_hash[..8.min(old_hash.len())],

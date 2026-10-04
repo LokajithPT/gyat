@@ -17,9 +17,16 @@ pub fn compress_file(src: &Path, dst: &Path, level: u32) -> Result<(), String> {
         let mut enc = GzEncoder::new(file, Compression::new(level));
         enc.write_all(&data).map_err(|e| format!("compress: {e}"))?;
         enc.finish().map_err(|e| format!("finish: {e}"))?;
+        // force the compressed bytes to disk before the rename publishes them
+        open_file(&tmp)?.sync_all().map_err(|e| format!("fsync {}: {e}", tmp.display()))?;
     }
     fs::rename(&tmp, dst).map_err(|e| format!("rename into {}: {e}", dst.display()))?;
+    if let Some(p) = dst.parent() { crate::utils::repo::fsync_dir(p); }
     Ok(())
+}
+
+fn open_file(p: &std::path::Path) -> Result<std::fs::File, String> {
+    std::fs::File::open(p).map_err(|e| format!("open {}: {e}", p.display()))
 }
 
 pub fn decompress_file(src: &Path, dst: &Path) -> Result<(), String> {
@@ -78,7 +85,9 @@ pub fn read_bytes_maybe_compressed(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 pub fn should_compress(settings: &crate::utils::settings::GyatSettings) -> bool {
-    settings.compression.enabled && settings.compression.algorithm == "gzip"
+    // Only gzip is implemented. Anything other than an explicit "none" uses
+    // gzip, so a typo like "zstd" no longer silently disables compression.
+    settings.compression.enabled && settings.compression.algorithm != "none"
 }
 
 pub fn level(settings: &crate::utils::settings::GyatSettings) -> u32 {

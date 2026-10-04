@@ -89,6 +89,5 @@ pub fn ensure_default(repo_name: &str) -> Result<(), String> {
     cfg.compression.enabled = true;
     cfg.compression.algorithm = "gzip".to_string();
     cfg.compression.level = 6;
-    cfg.chunks.size = 4096;
     save(&cfg)
 }

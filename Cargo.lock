@@ -199,6 +199,7 @@ dependencies = [
  "glob",
  "gyat-bundle",
  "hex",
+ "libc",
  "owo-colors",
  "serde",
  "sha2",
@@ -220,6 +221,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "gyat-bundle",
+ "libc",
  "serde",
  "toml",
  "walkdir",

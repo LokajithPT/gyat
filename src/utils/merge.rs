@@ -19,6 +19,57 @@ fn read_snapshot_lines(hash: &str, rel: &Path) -> Vec<String> {
     }
 }
 
+/// True when a stored file holds bytes we cannot safely treat as text.
+///
+/// merge worked on `read_to_string(...).lines()`, which fails on non-UTF-8 and
+/// yields *empty* lines. A binary file therefore looked empty on all three
+/// sides of a three-way merge, so the merge happily "succeeded" and could
+/// stage empty or wrong content. Binary files need a real merge driver.
+/// Stage a file from raw bytes, preserving them exactly.
+fn write_bytes_staged(rel: &Path, data: &[u8]) -> Result<(), String> {
+    let dst = repo::stages_root().join(rel);
+    if let Some(p) = dst.parent() { fs::create_dir_all(p).map_err(|e| format!("mkdir {p:?}: {e}"))?; }
+    repo::write_durable(&dst, data)
+}
+
+fn is_binary_snapshot(hash: &str, rel: &Path) -> bool {
+    let snap = repo::commit_snapshot_root(hash);
+    let gz = PathBuf::from(format!("{}.gz", snap.join(rel).display()));
+    let actual = if snap.join(rel).exists() { snap.join(rel) } else if gz.exists() { gz } else { return false };
+    let bytes = if super::compression::is_compressed(&actual) {
+        let tmp = std::env::temp_dir().join(format!("gyat-bincheck-{}", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        if super::compression::decompress_file(&actual, &tmp).is_err() { return true; }
+        let b = fs::read(&tmp).unwrap_or_default();
+        let _ = fs::remove_file(&tmp);
+        b
+    } else {
+        match fs::read(&actual) {
+            Ok(b) => b,
+            Err(_) => return false,
+        }
+    };
+    bytes.contains(&0u8) || std::str::from_utf8(&bytes).is_err()
+}
+
+/// Raw stored bytes of a file in a commit snapshot, gunzipping if needed.
+fn snapshot_bytes(hash: &str, rel: &Path) -> Option<Vec<u8>> {
+    let snap = repo::commit_snapshot_root(hash);
+    let plain = snap.join(rel);
+    let gz = PathBuf::from(format!("{}.gz", plain.display()));
+    if plain.exists() { return fs::read(&plain).ok(); }
+    if gz.exists() {
+        let tmp = std::env::temp_dir().join(format!("gyat-binread-{}-{}", std::process::id(), rel.display().to_string().replace('/', "_")));
+        let _ = fs::remove_file(&tmp);
+        let res = super::compression::decompress_file(&gz, &tmp);
+        let bytes = fs::read(&tmp).ok();
+        let _ = fs::remove_file(&tmp);
+        if res.is_err() { return None; }
+        return bytes;
+    }
+    None
+}
+
 fn snapshot_has_file(hash: &str, rel: &Path) -> bool {
     let snap = repo::commit_snapshot_root(hash);
     let gz = PathBuf::from(format!("{}.gz", snap.join(rel).display()));
@@ -150,6 +201,7 @@ pub fn merge_branch(target_branch: &str, message: Option<String>) -> Result<(), 
     fs::create_dir_all(&stages).map_err(|e| format!("mkdir stages: {e}"))?;
 
     let mut conflicts = vec![];
+    let mut binary_conflicts = vec![];
     for rel_str in &all {
         let rel = Path::new(rel_str);
         let base_lines = base_hash.as_ref().map(|h| read_snapshot_lines(h, rel)).unwrap_or_default();
@@ -158,6 +210,29 @@ pub fn merge_branch(target_branch: &str, message: Option<String>) -> Result<(), 
         let cur_exists = snapshot_has_file(&cur_hash, rel);
         let tgt_exists = snapshot_has_file(&tgt_hash, rel);
         let base_exists = base_hash.as_ref().map(|h| snapshot_has_file(h, rel)).unwrap_or(false);
+
+        // Binary content must be compared as bytes. `read_snapshot_lines`
+        // returns an empty vec for non-UTF-8, so all three sides looked
+        // identical and the merge silently staged an empty file.
+        let any_binary = is_binary_snapshot(&cur_hash, rel)
+            || is_binary_snapshot(&tgt_hash, rel)
+            || base_hash.as_ref().map(|h| is_binary_snapshot(h, rel)).unwrap_or(false);
+        if any_binary {
+            let b = base_hash.as_ref().and_then(|h| snapshot_bytes(h, rel)).unwrap_or_default();
+            let c = snapshot_bytes(&cur_hash, rel).unwrap_or_default();
+            let t = snapshot_bytes(&tgt_hash, rel).unwrap_or_default();
+            if c == t {
+                // identical on both sides: nothing to do
+            } else if c == b {
+                // only the target changed
+                write_bytes_staged(rel, &t)?;
+            } else if t == b {
+                // only the current branch changed: leave the working copy alone
+            } else {
+                binary_conflicts.push(rel_str.clone());
+            }
+            continue;
+        }
 
         if !base_exists && !cur_exists && tgt_exists {
             write_staged(rel, &tgt_lines)?;
@@ -206,6 +281,9 @@ pub fn merge_branch(target_branch: &str, message: Option<String>) -> Result<(), 
     }
     // sync working tree to staged (for both conflict and auto-merge)
     for rel_str in &all {
+        // A binary conflict is intentionally left unstaged, so it must not be
+        // mistaken for a merged deletion - that removed the user's file.
+        if binary_conflicts.iter().any(|b| b == rel_str) { continue; }
         let rel = Path::new(rel_str);
         let staged = super::repo::stages_root().join(rel);
         let ws = Path::new(".").join(rel);
@@ -219,6 +297,20 @@ pub fn merge_branch(target_branch: &str, message: Option<String>) -> Result<(), 
                 println!("deleted {} (merged deletion)", rel_str);
             }
         }
+    }
+
+    if !binary_conflicts.is_empty() {
+        // Report before anything else: these cannot be resolved with markers.
+        let _ = super::repo::write_merge_head(&tgt_hash);
+        println!("binary conflict(s) in {} file(s) - no line-based merge is possible:", binary_conflicts.len());
+        for f in &binary_conflicts { println!("  {f}"); }
+        println!("resolve manually (pick one side, or merge with an external tool), then:");
+        println!("  gyat add <files> && gyat commit -m \"Merge {target_branch} into {cur_branch}\"");
+        println!("MERGE_HEAD set - next commit will be merge commit");
+        return Err(format!(
+            "binary files need manual merging: {}",
+            binary_conflicts.join(", ")
+        ));
     }
 
     if !conflicts.is_empty() {

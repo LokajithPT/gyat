@@ -184,7 +184,7 @@ enabled = true
 algorithm = "gzip"
 level = 6
 
-[chunks]
+# [chunks] is reserved and unused (chunked storage is not implemented)
 size = 4096
 
 [server]

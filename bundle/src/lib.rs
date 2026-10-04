@@ -139,7 +139,14 @@ pub fn unpack_to(reader: &mut impl Read, dst_dir: &Path) -> Result<usize, String
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("bundle unpack mkdir: {e}"))?;
         }
-        fs::write(&target, data).map_err(|e| format!("bundle unpack write: {e}"))?;
+        // Durable: the server unpacks a push straight into its repo, so a
+        // half-written file here would become a corrupt commit on disk.
+        {
+            use std::io::Write;
+            let mut f = fs::File::create(&target).map_err(|e| format!("bundle unpack write: {e}"))?;
+            f.write_all(&data).map_err(|e| format!("bundle unpack write: {e}"))?;
+            f.sync_all().map_err(|e| format!("bundle unpack fsync: {e}"))?;
+        }
     }
     Ok(staged.len())
 }

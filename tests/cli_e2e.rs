@@ -1385,3 +1385,211 @@ fn incremental_push_transfers_only_new_commits() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---- robustness regressions ------------------------------------------------
+
+/// A binary file changed on both sides cannot be merged line-by-line. Reading
+/// it as text yields empty on both sides, so the merge used to stage an empty
+/// file and report success. It must refuse and leave the file alone.
+#[test]
+fn binary_conflict_refuses_and_preserves_bytes() {
+    let dir = fresh_dir("binmerge");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "bm", server.to_str().unwrap()).ok);
+    let base: Vec<u8> = (0u8..=255).cycle().take(5120).collect();
+
+    fs::write(dir.join("b.bin"), &base).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+    assert!(run(&dir, &["branch", "side"], None).ok);
+
+    let mut mine = base.clone();
+    mine.extend_from_slice(b"MINE");
+    fs::write(dir.join("b.bin"), &mine).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    assert!(run(&dir, &["commit", "main edits"], None).ok);
+
+    assert!(run(&dir, &["travel", "side"], None).ok);
+    let mut theirs = b"THEIRS".to_vec();
+    theirs.extend_from_slice(&base);
+    fs::write(dir.join("b.bin"), &theirs).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    assert!(run(&dir, &["commit", "side edits"], None).ok);
+
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    let o = run(&dir, &["merge", "side"], None);
+    assert!(!o.ok, "binary conflict should fail the merge: {}", o.text);
+    assert!(o.text.contains("binary"), "{}", o.text);
+
+    // the file on disk must still be the user's own version, byte for byte
+    assert_eq!(
+        fs::read(dir.join("b.bin")).unwrap(),
+        mine,
+        "merge clobbered the binary file"
+    );
+    assert!(!read(&dir.join(".gyt/MERGE_HEAD")).trim().is_empty(), "MERGE_HEAD should be set");
+
+    // resolving manually completes the merge
+    fs::write(dir.join("b.bin"), &theirs).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    assert!(run(&dir, &["commit", "resolve binary"], None).ok);
+    assert!(read(&dir.join(".gyt/MERGE_HEAD")).trim().is_empty());
+    assert_eq!(fs::read(dir.join("b.bin")).unwrap(), theirs);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A binary file changed on only one side must merge cleanly, byte for byte.
+#[test]
+fn binary_one_sided_change_merges_exactly() {
+    let dir = fresh_dir("binone");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "bo", server.to_str().unwrap()).ok);
+    let base: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+    fs::write(dir.join("b.bin"), &base).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+    assert!(run(&dir, &["branch", "side"], None).ok);
+    assert!(run(&dir, &["travel", "side"], None).ok);
+
+    let mut theirs = b"SIDE".to_vec();
+    theirs.extend_from_slice(&base);
+    fs::write(dir.join("b.bin"), &theirs).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    assert!(run(&dir, &["commit", "side only"], None).ok);
+
+    assert!(run(&dir, &["travel", "main"], None).ok);
+    let o = run(&dir, &["merge", "side"], None);
+    assert!(o.ok, "one-sided binary merge should succeed: {}", o.text);
+    assert_eq!(fs::read(dir.join("b.bin")).unwrap(), theirs, "merged binary is not byte-exact");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Changing a binary file must be reported, not silently counted as no change.
+#[test]
+fn binary_change_is_reported_in_commit_stats() {
+    let dir = fresh_dir("binstat");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "bs", server.to_str().unwrap()).ok);
+    let base: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+    fs::write(dir.join("b.bin"), &base).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    assert!(run(&dir, &["commit", "base"], None).ok);
+
+    let mut next = base.clone();
+    next.extend_from_slice(b"CHANGED");
+    fs::write(dir.join("b.bin"), &next).unwrap();
+    assert!(run(&dir, &["add", "b.bin"], None).ok);
+    let o = run(&dir, &["commit", "binary change"], None);
+    assert!(o.ok, "commit failed: {}", o.text);
+    assert!(o.text.contains("1 file changed"), "binary change reported as nothing: {}", o.text);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A commit whose snapshot cannot be read must not be silently accepted, and
+/// meta.toml must be written durably before the commit is treated as real.
+#[test]
+fn commit_meta_is_written_before_the_commit_is_visible() {
+    let dir = fresh_dir("metadurable");
+    let server = dir.join("server");
+    fs::create_dir_all(&server).unwrap();
+    assert!(init_repo(&dir, "md", server.to_str().unwrap()).ok);
+    fs::write(dir.join("f.txt"), "one\n").unwrap();
+    assert!(run(&dir, &["add", "f.txt"], None).ok);
+    assert!(run(&dir, &["commit", "c1"], None).ok);
+
+    let tip = branch_hash(&dir, "main");
+    let meta = dir.join(format!(".gyt/commits/{tip}/meta.toml"));
+    assert!(meta.exists(), "meta.toml missing");
+    let body = read(&meta);
+    assert!(body.contains("c1"), "{}", body);
+    assert!(body.contains(&tip), "meta hash should match its directory");
+    // no temp files left behind by the durable write
+    let leftovers: Vec<String> = fs::read_dir(dir.join(".gyt/commits").join(&tip))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left in commit dir: {leftovers:?}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Concurrent pushes to one repo must all land, with nothing left behind.
+#[test]
+fn concurrent_pushes_do_not_corrupt_the_repo() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let root = fresh_dir("concurrent");
+    let shim = write_ssh_shim(&root);
+    let srv = root.join("srv");
+    fs::create_dir_all(&srv).unwrap();
+    let remote = format!("fakehost:{}/crepo", srv.display());
+
+    // build 6 independent clones so each pushes a different branch
+    let dirs: Vec<PathBuf> = (0..6)
+        .map(|i| {
+            let d = root.join(format!("c{i}"));
+            fs::create_dir_all(&d).unwrap();
+            d
+        })
+        .collect();
+    assert!(init_repo(&dirs[0], "crepo", &remote).ok);
+    fs::write(dirs[0].join("f.txt"), "base\n").unwrap();
+    assert!(run_ssh(&dirs[0], &shim, &srv, &["add", "f.txt"], None).ok);
+    assert!(run_ssh(&dirs[0], &shim, &srv, &["commit", "base"], None).ok);
+    assert!(run_ssh(&dirs[0], &shim, &srv, &["push"], None).ok);
+    // clone into fresh destinations (clone refuses an existing dir)
+    let clones: Vec<PathBuf> = (0..6).map(|i| root.join(format!("clone{i}"))).collect();
+    for (i, d) in clones.iter().enumerate() {
+        let oc = run_ssh(&root, &shim, &srv, &["clone", &remote, &format!("clone{i}")], None);
+        assert!(oc.ok, "clone {i} failed: {}", oc.text);
+        assert!(run_ssh(d, &shim, &srv, &["branch", &format!("b{i}")], None).ok);
+        // `branch` creates without switching, so attach HEAD explicitly
+        assert!(run_ssh(d, &shim, &srv, &["travel", &format!("b{i}")], None).ok);
+        fs::write(d.join(format!("f{i}.txt")), format!("v{i}\n")).unwrap();
+        assert!(run_ssh(d, &shim, &srv, &["add", &format!("f{i}.txt")], None).ok);
+        assert!(run_ssh(d, &shim, &srv, &["commit", &format!("c{i}")], None).ok);
+    }
+    let dirs = clones;
+
+    let server_bin = server_bin();
+    let done = Arc::new(AtomicUsize::new(0));
+    let srv2 = srv.clone();
+    let shim2 = shim.clone();
+    std::thread::scope(|s| {
+        for d in &dirs {
+            let done = Arc::clone(&done);
+            let srv2 = srv2.clone();
+            let shim2 = shim2.clone();
+            let dir = d.clone();
+            s.spawn(move || {
+                // clone in a thread-safe way, then push
+                let o = run_ssh(&dir, &shim2, &srv2, &["push"], None);
+                if o.ok {
+                    done.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    eprintln!("PUSH FAILED: {}", o.text);
+                }
+            });
+        }
+    });
+    assert_eq!(done.load(Ordering::SeqCst), dirs.len(), "not every concurrent push succeeded");
+    let _ = server_bin;
+
+    let refs: Vec<String> = fs::read_dir(srv.join("crepo/refs/heads"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    // main plus one branch per clone
+    assert_eq!(refs.len(), dirs.len() + 1, "expected {} branches, got {refs:?}", dirs.len() + 1);
+
+    let _ = fs::remove_dir_all(&root);
+}

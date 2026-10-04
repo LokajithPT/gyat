@@ -162,6 +162,13 @@ impl SshTarget {
             "StrictHostKeyChecking=accept-new".to_string(),
             "-o".to_string(),
             "ConnectTimeout=15".to_string(),
+            // ConnectTimeout only covers connecting. If the link drops during a
+            // transfer these make ssh notice a dead peer within ~45s instead
+            // of blocking until TCP gives up.
+            "-o".to_string(),
+            "ServerAliveInterval=15".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=3".to_string(),
         ];
         if let Some(key) = &self.key_path {
             if !key.is_empty() && key != "~/.ssh/id_ed25519" {

@@ -175,6 +175,20 @@ pub fn commit_with_message(message: String) -> Result<(), String> {
         // lines both before and after, so a content-only comparison reported
         // "0 files changed" for a commit that really did add a file.
         if existed_before && old_lines == new_lines {
+            // Lines cannot tell binary content apart (both sides read as
+            // empty), so fall back to comparing the bytes themselves.
+            let bytes_differ = match (
+                super::compression::read_bytes_maybe_compressed(&parent_file),
+                super::compression::read_bytes_maybe_compressed(&repo::stages_root().join(rel)),
+            ) {
+                (Ok(a), Ok(b)) => a != b,
+                _ => true,
+            };
+            if !bytes_differ {
+                continue;
+            }
+            total_ins += 0;
+            per_file.push((rel_str, 0, 0, false));
             continue;
         }
         let deltas = myers_diff(&old_lines, &new_lines);
@@ -291,7 +305,6 @@ pub fn create_commit_with_parents(message: String, second_parent: Option<String>
         content_combined.push_str(d);
     }
     content_combined.push_str(if settings.compression.enabled { "compressed" } else { "raw" });
-    content_combined.push_str(&settings.chunks.size.to_string());
     let hash = hash_commit(&parent, &second_parent, &message, &author, ts, &files, &content_combined);
 
     super::remote::progress(&format!("writing snapshot for {} file(s)", files.len()));
@@ -350,11 +363,11 @@ pub fn create_commit_with_parents(message: String, second_parent: Option<String>
                     for d in deltas { match d { Delta::Insert{line,text} => out.push_str(&format!("insert::{}::{}\n", line, text)), Delta::Delete{line} => out.push_str(&format!("delete::{}\n", line)), } }
                     if super::compression::should_compress(&settings) {
                         let tmp = deltas_root.join(format!("tmp_{}.delta", rel.to_string_lossy().replace('/', "__")));
-                        fs::write(&tmp, out).map_err(|e| format!("write tmp delta: {e}"))?;
+                        repo::write_durable(&tmp, out.as_bytes())?;
                         super::compression::compress_file(&tmp, &delta_path, super::compression::level(&settings))?;
                         let _ = fs::remove_file(tmp);
                     } else {
-                        fs::write(&delta_path, out).map_err(|e| format!("write delta {delta_path:?}: {e}"))?;
+                        repo::write_durable(&delta_path, out.as_bytes())?;
                     }
                 }
             }
@@ -364,7 +377,9 @@ pub fn create_commit_with_parents(message: String, second_parent: Option<String>
     let is_merge = second_parent.is_some();
     let meta = CommitMeta { hash: hash.clone(), parent: parent.clone(), second_parent, message: message.clone(), author, timestamp: ts, files: files.clone() };
     let meta_str = toml::to_string_pretty(&meta).map_err(|e| format!("serialize meta: {e}"))?;
-    fs::write(repo::commit_meta_path(&hash), meta_str).map_err(|e| format!("write meta: {e}"))?;
+    // meta.toml is what makes a commit readable at all, so it goes down
+    // durably before anything treats the commit as real.
+    repo::write_durable(&repo::commit_meta_path(&hash), meta_str.as_bytes())?;
     repo::write_head(&hash)?;
     if is_merge { let _ = repo::clear_merge_head(); }
     let current = repo::current_root();
